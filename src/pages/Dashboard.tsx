@@ -1,87 +1,130 @@
 import React, { useState } from 'react';
-import { Menu, ChevronUp, ChevronDown } from 'lucide-react';
+import { ChevronUp, ChevronDown } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer } from 'recharts';
-import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
-import { NavLink } from "@/components/NavLink";
-import { LayoutDashboard, Users, FileText } from "lucide-react";
-
-const navigation = [
-  { name: "Dashboard", href: "/dashboard", icon: LayoutDashboard },
-  { name: "Agent", href: "/agent", icon: Users },
-  { name: "Invoices", href: "/invoices", icon: FileText },
-];
+import { Users, FileText } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 const Dashboard = () => {
   const [open, setOpen] = useState(false);
+  const navigate = useNavigate();
 
-  const NavContent = () => (
-    <>
-      <div className="p-6 border-b border-[#2b2c3b]">
-        <h1 className="text-xl font-bold text-white">Menu</h1>
-      </div>
-      <nav className="flex-1 p-4 space-y-1">
-        {navigation.map((item) => (
-          <NavLink
-            key={item.name}
-            to={item.href}
-            className="flex items-center gap-3 px-4 py-3 text-gray-300 rounded-lg transition-colors hover:bg-[#2b2c3b]"
-            activeClassName="bg-[#2b2c3b] text-[#7c4dff] font-medium"
-            onClick={() => setOpen(false)}
-          >
-            <item.icon className="w-5 h-5" />
-            <span>{item.name}</span>
-          </NavLink>
-        ))}
-      </nav>
-    </>
-  );
-
-  // Chart Data
+  // Chart Data - Weekly Revenue (Car Garage)
   const chartData = [
-    { day: 'Mon', val: 500 },
-    { day: 'Tue', val: 1400 },
-    { day: 'Wed', val: 3800 },
-    { day: 'Thu', val: 2500 },
-    { day: 'Fri', val: 3200 },
-    { day: 'Sat', val: 3100 },
-    { day: 'Sun', val: 4100 },
+    { day: 'Mon', val: 320 },
+    { day: 'Tue', val: 480 },
+    { day: 'Wed', val: 650 },
+    { day: 'Thu', val: 520 },
+    { day: 'Fri', val: 720 },
+    { day: 'Sat', val: 680 },
+    { day: 'Sun', val: 240 },
   ];
 
-  // Product Data
-  const products = [
+  // Invoice Data - Car Garage Services
+  const invoices = [
     {
-      id: 1,
-      name: 'Creative Bag',
-      sku: '#20293654058',
-      status: 'Available',
-      views: '14k',
-      img: 'https://via.placeholder.com/100/7c4dff/ffffff?text=Bag'
+      id: "INV-001",
+      client: "Mike Johnson",
+      service: "Oil Change & Brake Inspection",
+      amount: "$89.50",
+      status: "Paid",
+      date: "2024-01-15",
     },
     {
-      id: 2,
-      name: 'Electric Mug',
-      sku: '#20293654056',
-      status: 'Available',
-      views: '8k',
-      img: 'https://via.placeholder.com/100/00E096/ffffff?text=Mug'
-    }
+      id: "INV-002",
+      client: "Sarah Martinez",
+      service: "Tire Replacement (4x)",
+      amount: "$420.00",
+      status: "Pending",
+      date: "2024-01-20",
+    },
+    {
+      id: "INV-003",
+      client: "David Chen",
+      service: "Engine Diagnostic & Repair",
+      amount: "$325.00",
+      status: "Paid",
+      date: "2024-01-22",
+    },
+    {
+      id: "INV-004",
+      client: "Emily Williams",
+      service: "AC System Service",
+      amount: "$145.00",
+      status: "Paid",
+      date: "2024-01-18",
+    },
   ];
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case "Paid":
+        return "text-[#00E096]";
+      case "Pending":
+        return "text-yellow-400";
+      case "Overdue":
+        return "text-red-400";
+      default:
+        return "text-gray-400";
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#171821] text-white p-4 sm:p-6 font-sans max-w-md mx-auto">
       
       {/* Header */}
-      <header className="flex justify-between items-center mb-6 sm:mb-8">
-        <Sheet open={open} onOpenChange={setOpen}>
-          <SheetTrigger asChild>
-            <button className="p-2 hover:bg-white/10 rounded-full">
-              <Menu className="w-6 h-6 text-gray-300" />
+      <header className="flex justify-between items-center mb-6 sm:mb-8 relative">
+        <div className="flex items-center gap-2">
+          {/* Hamburger Menu Button */}
+          <button 
+            onClick={() => setOpen(!open)}
+            className="p-2.5 hover:bg-white/10 rounded-xl relative z-10 active:scale-95 transition-transform"
+          >
+            {/* Custom Mobile Hamburger Menu */}
+            <div className="w-6 h-5 flex flex-col justify-between">
+              <span className={`block h-0.5 w-full bg-gray-300 rounded-full transition-all duration-300 ${open ? 'rotate-45 translate-y-2' : ''}`}></span>
+              <span className={`block h-0.5 w-full bg-gray-300 rounded-full transition-all duration-300 ${open ? 'opacity-0' : ''}`}></span>
+              <span className={`block h-0.5 w-full bg-gray-300 rounded-full transition-all duration-300 ${open ? '-rotate-45 -translate-y-2' : ''}`}></span>
+            </div>
+          </button>
+          
+          {/* Sliding Icons */}
+          <div className="flex items-center gap-2 overflow-hidden">
+            {/* Agent Icon */}
+            <button
+              onClick={() => {
+                navigate('/agent');
+                setOpen(false);
+              }}
+              className={`
+                p-2.5 bg-[#21222D] hover:bg-[#2b2c3b] rounded-xl shadow-lg
+                transition-all duration-300 ease-out
+                border border-[#2b2c3b]
+                ${open ? 'translate-x-0 opacity-100' : 'translate-x-[-100%] opacity-0 pointer-events-none'}
+              `}
+              style={{ transitionDelay: open ? '100ms' : '0ms' }}
+            >
+              <Users className="w-5 h-5 text-[#7c4dff]" />
             </button>
-          </SheetTrigger>
-          <SheetContent side="left" className="w-64 bg-[#21222D] p-0 border-r border-[#2b2c3b]">
-            <NavContent />
-          </SheetContent>
-        </Sheet>
+            
+            {/* Invoice Icon */}
+            <button
+              onClick={() => {
+                navigate('/invoices');
+                setOpen(false);
+              }}
+              className={`
+                p-2.5 bg-[#21222D] hover:bg-[#2b2c3b] rounded-xl shadow-lg
+                transition-all duration-300 ease-out
+                border border-[#2b2c3b]
+                ${open ? 'translate-x-0 opacity-100' : 'translate-x-[-100%] opacity-0 pointer-events-none'}
+              `}
+              style={{ transitionDelay: open ? '200ms' : '0ms' }}
+            >
+              <FileText className="w-5 h-5 text-[#00E096]" />
+            </button>
+          </div>
+        </div>
+        
         <div className="w-10 h-10 rounded-xl overflow-hidden border-2 border-[#2b2c3b]">
           <div className="w-full h-full bg-gradient-to-br from-[#7c4dff] to-[#00E096] flex items-center justify-center text-white font-bold text-lg">
             JD
@@ -99,24 +142,24 @@ const Dashboard = () => {
         {/* Sales Card */}
         <div className="bg-[#21222D] p-4 sm:p-5 rounded-2xl sm:rounded-3xl shadow-lg">
           <p className="text-gray-400 text-xs mb-1 sm:mb-2 text-center">Total Sales</p>
-          <h2 className="text-xl sm:text-2xl font-bold text-center mb-1 sm:mb-2">$4,200</h2>
+          <h2 className="text-xl sm:text-2xl font-bold text-center mb-1 sm:mb-2">$2,840</h2>
           <div className="flex justify-center items-center text-[#00E096] text-xs font-medium">
             <div className="bg-[#00E096]/20 p-0.5 rounded-full mr-1">
                 <ChevronUp size={12} strokeWidth={3} />
             </div>
-            1.5%
+            8.2%
           </div>
         </div>
 
-        {/* Visitors Card */}
+        {/* Invoices Card */}
         <div className="bg-[#21222D] p-4 sm:p-5 rounded-2xl sm:rounded-3xl shadow-lg">
-          <p className="text-gray-400 text-xs mb-1 sm:mb-2 text-center">Total Visitors</p>
-          <h2 className="text-xl sm:text-2xl font-bold text-center mb-1 sm:mb-2">18,729</h2>
+          <p className="text-gray-400 text-xs mb-1 sm:mb-2 text-center">Total Invoices</p>
+          <h2 className="text-xl sm:text-2xl font-bold text-center mb-1 sm:mb-2">18</h2>
           <div className="flex justify-center items-center text-[#00E096] text-xs font-medium">
             <div className="bg-[#00E096]/20 p-0.5 rounded-full mr-1">
                 <ChevronUp size={12} strokeWidth={3} />
             </div>
-            0.3%
+            5.9%
           </div>
         </div>
       </div>
@@ -153,9 +196,9 @@ const Dashboard = () => {
                 axisLine={false} 
                 tickLine={false} 
                 tick={{ fill: '#6b7280', fontSize: 10 }} 
-                tickFormatter={(value) => `$${value/1000}k`}
-                domain={[0, 4500]}
-                ticks={[0, 1000, 2000, 3000, 4000]}
+                tickFormatter={(value) => `$${value}`}
+                domain={[0, 800]}
+                ticks={[0, 200, 400, 600, 800]}
               />
               <Line 
                 type="monotone" 
@@ -184,32 +227,27 @@ const Dashboard = () => {
         </div>
       </div>
 
-      {/* Popular Products */}
+      {/* Recent Invoices */}
       <div>
-        <h3 className="font-medium mb-3 sm:mb-4 text-base sm:text-lg">Popular Products</h3>
+        <h3 className="font-medium mb-3 sm:mb-4 text-base sm:text-lg">Recent Invoices</h3>
         <div className="flex flex-col gap-3 sm:gap-4">
-          {products.map((product) => (
-            <div key={product.id} className="bg-[#21222D] p-3 sm:p-4 rounded-2xl sm:rounded-3xl flex items-center justify-between shadow-lg">
-              <div className="flex items-center gap-3 sm:gap-4">
-                <div className="w-10 h-10 sm:w-12 sm:h-12 bg-white rounded-xl p-1 overflow-hidden flex-shrink-0">
-                  <img src={product.img} alt={product.name} className="w-full h-full object-contain rounded-lg" />
+          {invoices.map((invoice) => (
+            <div key={invoice.id} className="bg-[#21222D] p-3 sm:p-4 rounded-2xl sm:rounded-3xl shadow-lg">
+              <div className="flex items-start justify-between mb-2">
+                <div className="flex-1">
+                  <h4 className="font-medium text-sm mb-1">{invoice.id}</h4>
+                  <p className="text-xs text-gray-400 mb-1">{invoice.client}</p>
+                  <p className="text-xs text-gray-500">{invoice.service}</p>
                 </div>
-                <div>
-                  <h4 className="font-medium text-sm">{product.name}</h4>
-                  <p className="text-xs text-gray-500">{product.sku}</p>
+                <div className="text-right ml-3">
+                  <div className="font-semibold text-sm mb-1">{invoice.amount}</div>
+                  <span className={`text-xs font-medium ${getStatusColor(invoice.status)}`}>
+                    {invoice.status}
+                  </span>
                 </div>
               </div>
-              <div className="text-right">
-                <div className="text-[#00E096] text-xs font-medium mb-1 flex items-center justify-end gap-1">
-                    <div className="w-1.5 h-1.5 rounded-full bg-[#00E096]"></div>
-                    {product.status}
-                </div>
-                <div className="text-xs text-gray-400 flex items-center justify-end gap-1">
-                    <div className="bg-gray-600/50 p-0.5 rounded-full">
-                         <ChevronUp size={8} className="text-gray-300" /> 
-                    </div>
-                    {product.views} views
-                </div>
+              <div className="text-xs text-gray-500 pt-2 border-t border-[#2b2c3b]">
+                {invoice.date}
               </div>
             </div>
           ))}
@@ -221,3 +259,4 @@ const Dashboard = () => {
 };
 
 export default Dashboard;
+
