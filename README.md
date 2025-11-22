@@ -1,6 +1,6 @@
-#OrangeAI
 
-# 🤖 AI-Powered Service Job Management System
+
+# 🍊 OrangeAI
 
 A revolutionary hands-free job management platform that connects customers via WhatsApp with contractors through an AI-powered mobile app. The system automatically creates invoices from voice transcripts while keeping customers informed in real-time.
 
