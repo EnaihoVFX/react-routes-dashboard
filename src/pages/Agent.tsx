@@ -39,15 +39,15 @@ const agents = [
 
 const Agent = () => {
   return (
-    <div className="p-8 space-y-8">
-      <div className="flex items-center justify-between">
+    <div className="p-4 sm:p-6 lg:p-8 space-y-6 sm:space-y-8">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">Agents</h1>
-          <p className="text-muted-foreground mt-2">
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Agents</h1>
+          <p className="text-muted-foreground mt-2 text-sm sm:text-base">
             Manage your team members and their roles.
           </p>
         </div>
-        <Button className="gap-2">
+        <Button className="gap-2 w-full sm:w-auto">
           <Plus className="w-4 h-4" />
           Add Agent
         </Button>
