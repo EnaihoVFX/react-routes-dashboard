@@ -1,7 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, Play, Pause, CheckCircle, Trash2, Plus, Clock, Send, DollarSign, User, ShieldCheck, ArrowLeft, FileText, Mail, Image as ImageIcon } from 'lucide-react';
+import { Mic, Play, Pause, CheckCircle, Trash2, Plus, Clock, Send, DollarSign, User, ShieldCheck, ArrowLeft, FileText, Mail, Image as ImageIcon, Edit2, X, Gift } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { extractInvoiceItemsWithAI } from '@/lib/openai-agent';
+import { sendWebhookUpdate, sendJobSummary } from '@/lib/webhook-service';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+import { Label } from '@/components/ui/label';
 
 const Agent = () => {
   // App States: 'start', 'working', 'summary', 'invoice-sent'
@@ -13,6 +19,10 @@ const Agent = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isProcessingAI, setIsProcessingAI] = useState(false);
+  const [showAddLaborDialog, setShowAddLaborDialog] = useState(false);
+  const [showAddItemDialog, setShowAddItemDialog] = useState(false);
+  const [showEditLaborDialog, setShowEditLaborDialog] = useState(false);
+  const [editingItem, setEditingItem] = useState(null);
   const navigate = useNavigate();
   
   // Data States
@@ -35,8 +45,15 @@ const Agent = () => {
   const invoiceEndRef = useRef(null);
 
   const scrollToBottom = () => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    invoiceEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    // Use setTimeout to ensure DOM is updated
+    setTimeout(() => {
+      if (transcriptEndRef.current) {
+        transcriptEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+      }
+      if (invoiceEndRef.current) {
+        invoiceEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" });
+      }
+    }, 100);
   };
 
   useEffect(() => {
@@ -196,9 +213,18 @@ const Agent = () => {
       const transcriptionText = data.text || data.transcription || data.transcript || JSON.stringify(data);
       
       if (transcriptionText && transcriptionText.trim().length > 0) {
+        // Clean the transcription to remove audio annotations
+        const cleanedText = cleanTranscription(transcriptionText);
+        
+        // Skip if cleaned text is empty or too short
+        if (!cleanedText || cleanedText.length < 2) {
+          console.log('⏭️ Skipping transcription (noise/annotation only):', transcriptionText);
+          return transcriptionText;
+        }
+        
         const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const newTranscriptEntry = {
-          text: transcriptionText.trim(),
+          text: cleanedText,
           timestamp: timestamp,
         };
         
@@ -444,10 +470,19 @@ const Agent = () => {
       const transcriptionText = data.text || data.transcription || data.transcript;
       
       if (transcriptionText && transcriptionText.trim().length > 0) {
-        console.log(`📝 Got transcription: "${transcriptionText.trim()}"`);
+        // Clean the transcription to remove audio annotations
+        const cleanedText = cleanTranscription(transcriptionText);
+        
+        // Skip if cleaned text is empty or too short
+        if (!cleanedText || cleanedText.length < 2) {
+          console.log('⏭️ Skipping transcription (noise/annotation only):', transcriptionText);
+          return;
+        }
+        
+        console.log(`📝 Got transcription: "${cleanedText}"`);
         const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const newTranscriptEntry = {
-          text: transcriptionText.trim(),
+          text: cleanedText,
           timestamp: timestamp,
         };
         
@@ -933,8 +968,13 @@ const Agent = () => {
     setIsProcessingAI(true);
     
     try {
-      console.log('🤖 Processing transcript with OpenAI...');
-      const items = await extractInvoiceItemsWithAI(text);
+      console.log('🤖 Processing transcript with OpenAI (extraction)...', { 
+        textLength: text.length, 
+        itemsCount: transcriptItems.length 
+      });
+      
+      // Extract items with OpenAI (main task - fast)
+      const items = await extractInvoiceItemsWithAI(text, undefined, transcriptItems);
       
       if (items && items.length > 0) {
         console.log('✅ Extracted items:', items);
@@ -945,6 +985,25 @@ const Agent = () => {
           const newItems = items.filter(item => !existingNames.has(item.name.toLowerCase()));
           
           if (newItems.length > 0) {
+            // Send webhook updates in parallel (Gemini will handle explanations)
+            const transcriptText = transcriptItems.map(t => t.text).join(' ');
+            
+            // Send all webhook updates in parallel for speed
+            Promise.all(
+              newItems.map(item => 
+                sendWebhookUpdate('item_added', item, {
+                  jobNumber: '4092',
+                  customer: 'John Doe',
+                  vehicle: '2018 Ford Focus'
+                }, transcriptText).catch(err => {
+                  console.error('Webhook error for item:', item.name, err);
+                  return null; // Don't fail all if one fails
+                })
+              )
+            ).then(() => {
+              console.log('✅ All webhook updates sent');
+            });
+            
             return [...prev, ...newItems];
           }
           return prev;
@@ -1042,6 +1101,59 @@ const Agent = () => {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   };
 
+  // Clean transcription text by removing audio annotations and noise
+  const cleanTranscription = (text) => {
+    if (!text || typeof text !== 'string') {
+      return '';
+    }
+
+    let cleaned = text.trim();
+
+    // Remove common audio annotation patterns (case-insensitive)
+    const audioAnnotations = [
+      /\s*\(footsteps?\)\s*/gi,
+      /\s*\(music\)\s*/gi,
+      /\s*\(techno music\)\s*/gi,
+      /\s*\(slow music plays?\)\s*/gi,
+      /\s*\(background music\)\s*/gi,
+      /\s*\(background chatter\)\s*/gi,
+      /\s*\(people chattering\)\s*/gi,
+      /\s*\(people talking in the background\)\s*/gi,
+      /\s*\(voices? in background\)\s*/gi,
+      /\s*\(people talking\)\s*/gi,
+      /\s*\(glasses clinking\)\s*/gi,
+      /\s*\(laughs?\)\s*/gi,
+      /\s*\(screams?\)\s*/gi,
+      /\s*\(.*?\)\s*/g, // Remove any remaining parenthetical annotations
+    ];
+
+    // Remove all audio annotations
+    audioAnnotations.forEach(pattern => {
+      cleaned = cleaned.replace(pattern, ' ');
+    });
+
+    // Remove multiple spaces
+    cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+    // Filter out very short or meaningless entries
+    if (cleaned.length < 2) {
+      return '';
+    }
+
+    // Filter out entries that are just punctuation or filler
+    const meaninglessPatterns = [
+      /^[\.\,\!\?\;\:\-\s]+$/, // Only punctuation
+      /^(uh|um|ah|eh|oh|hmm|huh|yeah|yes|no|ok|okay|ya|yep|nope|yup)$/i, // Just filler words
+      /^[""]+$/, // Just quotes
+    ];
+
+    if (meaninglessPatterns.some(pattern => pattern.test(cleaned))) {
+      return '';
+    }
+
+    return cleaned;
+  };
+
   // Auto-start recording when entering working view (optional - can be removed if manual start preferred)
   // useEffect(() => {
   //   if (view === 'working' && !isRecording && !streamRef.current) {
@@ -1067,7 +1179,8 @@ const Agent = () => {
       setInvoiceItems(prev => [...prev, { id: Date.now(), ...data }]);
     } 
     else if (actionType === 'add_labor') {
-      setInvoiceItems(prev => [...prev, { id: Date.now(), name: 'Labor (1 Hour)', price: 85, type: 'labor' }]);
+      // Open dialog to add labor with description
+      setShowAddLaborDialog(true);
     }
     else if (actionType === 'remove_last') {
        setInvoiceItems(prev => prev.slice(0, -1)); // Removes last item
@@ -1075,11 +1188,33 @@ const Agent = () => {
     else if (actionType === 'make_free') {
        setInvoiceItems(prev => {
          const newItems = [...prev];
-         if(newItems.length > 0) newItems[newItems.length - 1].price = 0;
+         if(newItems.length > 0) {
+           const lastItem = newItems[newItems.length - 1];
+           newItems[newItems.length - 1] = { ...lastItem, price: 0 };
+           
+           // Send webhook update
+           sendWebhookUpdate('item_made_free', newItems[newItems.length - 1], {
+             jobNumber: '4092',
+             customer: 'John Doe',
+             vehicle: '2018 Ford Focus'
+           }).catch(err => console.error('Webhook error:', err));
+         }
          return newItems;
        });
     }
+    else if (actionType === 'add_manual_item') {
+      // Open dialog to manually add item
+      setShowAddItemDialog(true);
+    }
     else if (actionType === 'finish') {
+      // Send job summary to webhook
+      const currentTotal = invoiceItems.reduce((sum, item) => sum + item.price, 0);
+      sendJobSummary(invoiceItems, currentTotal, {
+        jobNumber: '4092',
+        customer: 'John Doe',
+        vehicle: '2018 Ford Focus'
+      }).catch(err => console.error('Webhook error:', err));
+      
       setTimeout(() => setView('summary'), 1000);
     }
   };
@@ -1163,10 +1298,16 @@ const Agent = () => {
                             {item.description && (
                               <p className="text-xs text-muted-foreground mt-0.5">{item.description}</p>
                             )}
+                            {item.laborDescription && (
+                              <p className="text-xs text-muted-foreground mt-0.5 italic">Work: {item.laborDescription}</p>
+                            )}
                             <div className="flex items-center gap-2 mt-1">
                         <p className="text-xs text-muted-foreground capitalize">{item.type}</p>
                               {item.category && (
                                 <span className="text-xs text-muted-foreground">• {item.category}</span>
+                              )}
+                              {item.hours && item.hours > 0 && (
+                                <span className="text-xs text-muted-foreground">• {item.hours}hr{item.hours > 1 ? 's' : ''}</span>
                               )}
                       </div>
                     </div>
@@ -1205,6 +1346,13 @@ const Agent = () => {
           <button 
             className="bg-[#7c4dff] py-3 rounded-xl font-medium text-sm sm:text-base flex items-center justify-center gap-2 hover:bg-[#6d3fef] transition-colors text-white"
             onClick={() => {
+              // Send final invoice summary to webhook
+              sendJobSummary(invoiceItems, total, {
+                jobNumber: '4092',
+                customer: 'John Doe',
+                vehicle: '2018 Ford Focus'
+              }).catch(err => console.error('Webhook error:', err));
+              
               setIsAnimating(true);
               setTimeout(() => {
                 setView('invoice-sent');
@@ -1323,172 +1471,256 @@ const Agent = () => {
 
   // --- VIEW: 2. LIVE WORK SCREEN (MAIN UI) ---
   return (
-    <div className="h-screen bg-background text-foreground font-sans flex flex-col relative max-w-md mx-auto">
+    <div className="h-screen max-h-screen bg-background text-foreground font-sans flex flex-col relative max-w-md mx-auto overflow-hidden">
       
       {/* Header & Customer Status */}
-      <header className="bg-card/50 backdrop-blur-md p-4 border-b border-border z-20 flex justify-between items-start">
-        <div className="flex-1">
-            <div className="flex items-center gap-2 mb-1">
-                <div className={`w-2 h-2 rounded-full ${isRecording ? 'bg-red-500 animate-pulse' : 'bg-gray-400'}`}></div>
-                <span className="text-xs font-bold uppercase tracking-wider">
-                  {isRecording ? 'Live Transcribing...' : isTranscribing ? 'Processing...' : 'Ready'}
-                </span>
+      <header className="bg-card/80 backdrop-blur-lg p-3 sm:p-4 border-b border-border z-20 sticky top-0 flex-shrink-0">
+        <div className="flex items-center justify-between mb-2 sm:mb-3">
+          <div className="flex items-center gap-2">
+            <div className={`w-2.5 h-2.5 sm:w-3 sm:h-3 rounded-full ${isRecording ? 'bg-red-500 animate-pulse shadow-lg shadow-red-500/50' : 'bg-gray-400'}`}></div>
+            <span className="text-[10px] sm:text-xs font-bold uppercase tracking-wider">
+              {isRecording ? 'Live Transcribing...' : isTranscribing ? 'Processing...' : 'Ready'}
+            </span>
             </div>
-            <div className="flex items-center gap-1.5 text-[#00E096] text-xs bg-[#00E096]/10 px-2 py-1 rounded-full border border-[#00E096]/20">
-                <ShieldCheck size={12} />
-                {customerStatus}
-            </div>
-        </div>
-        <button onClick={() => handleVoiceInput("I'm done.", 'finish')} className="text-xs bg-card hover:bg-accent hover:text-accent-foreground px-3 py-1 rounded-lg border border-border transition-colors">
+          <button 
+            onClick={() => handleVoiceInput("I'm done.", 'finish')} 
+            className="text-[11px] sm:text-xs bg-card hover:bg-accent hover:text-accent-foreground px-3 sm:px-4 py-2 sm:py-2.5 rounded-lg border border-border transition-colors font-medium min-h-[44px] touch-manipulation"
+          >
             End Job
         </button>
+        </div>
+        <div className="flex items-center gap-1.5 text-[#00E096] text-[11px] sm:text-xs bg-[#00E096]/10 px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-full border border-[#00E096]/20 w-fit">
+          <ShieldCheck size={12} className="sm:w-[14px] sm:h-[14px]" />
+          <span className="font-medium">{customerStatus}</span>
+        </div>
       </header>
 
       {/* TOP SECTION: TRANSCRIPT (35% Height) */}
-      <div className="flex-none h-[35%] bg-background p-4 overflow-y-auto border-b border-border">
-        <h3 className="text-muted-foreground text-xs uppercase font-bold mb-2 sticky top-0 bg-background py-1">Live Transcript</h3>
-        <div className="space-y-3">
+      <div className="flex-none h-[35%] min-h-[200px] max-h-[35vh] bg-gradient-to-b from-background to-background/95 overflow-hidden border-b border-border flex flex-col">
+        <div className="flex items-center justify-between p-3 sm:p-4 pb-2 bg-background/95 backdrop-blur-sm border-b border-border/50 flex-shrink-0">
+          <h3 className="text-muted-foreground text-[10px] sm:text-xs uppercase font-bold tracking-wider">Live Transcript</h3>
+          {transcript.length > 0 && (
+            <span className="text-[10px] sm:text-xs text-muted-foreground">{transcript.length} entries</span>
+          )}
+        </div>
+        <div className="flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4 pt-2" data-scroll-container>
+          <div className="space-y-2 sm:space-y-3">
           {isTranscribing && (
-            <p className="text-muted-foreground italic text-sm">Transcribing audio with ElevenLabs STT...</p>
+            <div className="flex items-center gap-2 text-muted-foreground text-xs sm:text-sm py-3 sm:py-4">
+              <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 bg-[#7c4dff] rounded-full animate-pulse"></div>
+              <span>Transcribing audio with ElevenLabs STT...</span>
+            </div>
           )}
           {transcriptError && (
-            <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
-              <p className="text-red-400 text-xs whitespace-pre-wrap">{transcriptError}</p>
+            <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3 sm:p-4">
+              <p className="text-red-400 text-[11px] sm:text-xs whitespace-pre-wrap leading-relaxed">{transcriptError}</p>
               <button 
                 onClick={() => setTranscriptError(null)} 
-                className="text-xs text-red-400 underline mt-2"
+                className="text-[11px] sm:text-xs text-red-400 hover:text-red-300 underline mt-2 font-medium min-h-[44px] touch-manipulation"
               >
                 Dismiss
               </button>
             </div>
           )}
           {!isTranscribing && !transcriptError && transcript.length === 0 && (
-            <div className="text-center py-8">
-              <Mic className="w-12 h-12 text-muted-foreground mx-auto mb-2 opacity-50" />
-              <p className="text-muted-foreground italic text-sm">Tap the floating button to start real-time transcription</p>
+            <div className="text-center py-8 sm:py-12">
+              <div className="w-14 h-14 sm:w-16 sm:h-16 bg-[#7c4dff]/10 rounded-full flex items-center justify-center mx-auto mb-2 sm:mb-3">
+                <Mic className="w-7 h-7 sm:w-8 sm:h-8 text-[#7c4dff] opacity-60" />
+              </div>
+              <p className="text-muted-foreground text-xs sm:text-sm font-medium">Ready to transcribe</p>
+              <p className="text-muted-foreground text-[10px] sm:text-xs mt-1">Tap the button below to start</p>
             </div>
           )}
           {transcript.map((t, i) => (
-            <div key={i} className="animate-fade-in-up">
-               <p className="text-[#7c4dff] text-sm leading-relaxed">"{t.text}"</p>
-               <span className="text-[10px] text-muted-foreground">{t.timestamp}</span>
+            <div key={i} className="animate-fade-in-up bg-card/50 border border-border/50 rounded-lg p-2.5 sm:p-3 hover:bg-card/80 transition-colors">
+              <p className="text-foreground text-xs sm:text-sm leading-relaxed mb-1">"{t.text}"</p>
+              <span className="text-[9px] sm:text-[10px] text-muted-foreground font-mono">{t.timestamp}</span>
             </div>
           ))}
-          <div ref={transcriptEndRef} />
+            <div ref={transcriptEndRef} />
+          </div>
         </div>
       </div>
 
       {/* BOTTOM SECTION: INVOICE CARDS (Remaining Height) */}
-      <div className="flex-1 bg-background p-4 overflow-y-auto relative">
-        <div className="sticky top-0 z-10 bg-background pb-2 flex justify-between items-center">
-             <h3 className="text-muted-foreground text-xs uppercase font-bold">
-               Detected Items
-               {isProcessingAI && (
-                 <span className="ml-2 text-[#7c4dff] animate-pulse">🤖 AI Processing...</span>
-               )}
-             </h3>
-             <span className="text-[#7c4dff] text-sm font-bold">Total: ${total.toFixed(2)}</span>
+      <div className="flex-1 min-h-0 bg-gradient-to-b from-background to-background/95 overflow-hidden flex flex-col">
+        <div className="flex-shrink-0 bg-background/95 backdrop-blur-sm border-b border-border p-3 sm:p-4 pb-2">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-1.5 sm:gap-2 flex-1 min-w-0">
+              <h3 className="text-muted-foreground text-[10px] sm:text-xs uppercase font-bold tracking-wider">
+                Invoice Items
+              </h3>
+              {isProcessingAI && (
+                <span className="text-[#7c4dff] text-[10px] sm:text-xs animate-pulse flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 bg-[#7c4dff] rounded-full"></span>
+                  <span className="hidden sm:inline">AI Processing...</span>
+                </span>
+              )}
+            </div>
+            <span className="text-[#7c4dff] text-sm sm:text-base font-bold ml-2">${total.toFixed(2)}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowAddItemDialog(true)}
+              className="flex-1 text-[11px] sm:text-xs bg-[#7c4dff] hover:bg-[#6d3fef] text-white px-3 sm:px-4 py-2.5 sm:py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 font-medium shadow-sm min-h-[44px] touch-manipulation"
+            >
+              <Plus size={14} className="sm:w-[14px] sm:h-[14px]" />
+              <span>Add Item</span>
+            </button>
+            <button
+              onClick={() => setShowAddLaborDialog(true)}
+              className="flex-1 text-[11px] sm:text-xs bg-orange-600 hover:bg-orange-500 text-white px-3 sm:px-4 py-2.5 sm:py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 font-medium shadow-sm min-h-[44px] touch-manipulation"
+            >
+              <Clock size={14} className="sm:w-[14px] sm:h-[14px]" />
+              <span>Add Labor</span>
+            </button>
+          </div>
         </div>
         
-        <div className="space-y-3 pb-32"> 
+        <div className="flex-1 overflow-y-auto overscroll-contain p-3 sm:p-4 pt-2" data-scroll-container>
+          <div className="space-y-2 sm:space-y-3 pb-32 sm:pb-36"> 
           {invoiceItems.length === 0 && (
-             <div className="border-2 border-dashed border-border rounded-xl h-32 flex items-center justify-center text-muted-foreground text-sm">
-                Mention parts or labor to add items
+             <div className="border-2 border-dashed border-border rounded-xl h-32 sm:h-40 flex flex-col items-center justify-center text-muted-foreground p-4 sm:p-6">
+               <Plus className="w-6 h-6 sm:w-8 sm:h-8 mb-2 opacity-40" />
+               <p className="text-xs sm:text-sm font-medium">No items yet</p>
+               <p className="text-[10px] sm:text-xs mt-1 text-center">Items will appear here as you speak or add them manually</p>
              </div>
           )}
           
           {invoiceItems.map((item) => (
-            <div key={item.id} className="bg-card border border-border p-4 rounded-xl shadow-lg animate-slide-in-right">
-              <div className="flex items-start gap-3">
+            <div key={item.id} className="bg-card border border-border p-3 sm:p-4 rounded-xl shadow-md hover:shadow-lg transition-shadow animate-slide-in-right">
+              <div className="flex items-start gap-2.5 sm:gap-3">
                 {/* Image or Icon */}
                 {item.imageUrl ? (
                   <img 
                     src={item.imageUrl} 
                     alt={item.name}
-                    className="w-16 h-16 object-cover rounded-lg border border-border"
+                    className="w-16 h-16 sm:w-20 sm:h-20 object-cover rounded-lg border border-border shrink-0"
                     onError={(e) => {
                       // Fallback to icon if image fails to load
                       e.currentTarget.style.display = 'none';
                     }}
                   />
                 ) : (
-                  <div className={`p-2 rounded-lg shrink-0 ${item.type === 'part' ? 'bg-[#7c4dff]/20 text-[#7c4dff]' : 'bg-orange-500/20 text-orange-400'}`}>
-                    {item.type === 'part' ? <Plus size={18}/> : <Clock size={18}/>}
+                  <div className={`p-2.5 sm:p-3 rounded-lg shrink-0 ${item.type === 'part' ? 'bg-[#7c4dff]/20 text-[#7c4dff]' : item.type === 'labor' ? 'bg-orange-500/20 text-orange-400' : 'bg-blue-500/20 text-blue-400'}`}>
+                    {item.type === 'part' ? <Plus size={18} className="sm:w-5 sm:h-5"/> : item.type === 'labor' ? <Clock size={18} className="sm:w-5 sm:h-5"/> : <FileText size={18} className="sm:w-5 sm:h-5"/>}
                 </div>
                 )}
                 
                 {/* Item Details */}
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-start justify-between gap-2 mb-1.5 sm:mb-2">
                     <div className="flex-1 min-w-0">
-                  <h4 className="font-medium text-sm">{item.name}</h4>
+                      <h4 className="font-semibold text-xs sm:text-sm leading-tight">{item.name}</h4>
                       {item.description && (
-                        <p className="text-xs text-muted-foreground mt-0.5">{item.description}</p>
+                        <p className="text-[11px] sm:text-xs text-muted-foreground mt-0.5 sm:mt-1 leading-relaxed">{item.description}</p>
                       )}
-                      <div className="flex items-center gap-2 mt-1">
-                  <p className="text-xs text-muted-foreground capitalize">{item.type}</p>
-                        {item.category && (
-                          <span className="text-xs text-muted-foreground">• {item.category}</span>
-                        )}
-                        {item.quantity && item.quantity > 1 && (
-                          <span className="text-xs text-muted-foreground">• Qty: {item.quantity}</span>
-                        )}
+                      {item.laborDescription && (
+                        <div className="mt-1 sm:mt-1.5 p-1.5 sm:p-2 bg-orange-500/5 border border-orange-500/20 rounded-md">
+                          <p className="text-[10px] sm:text-xs text-orange-400 font-medium mb-0.5">Work Performed:</p>
+                          <p className="text-[11px] sm:text-xs text-muted-foreground leading-relaxed">{item.laborDescription}</p>
                 </div>
-                      {item.partNumber && (
-                        <p className="text-xs text-muted-foreground mt-0.5">Part #: {item.partNumber}</p>
                       )}
               </div>
-                    <div className="text-right shrink-0">
-                <span className="font-bold text-lg">
+                    <div className="text-right shrink-0 ml-1.5 sm:ml-2">
+                      <span className="font-bold text-base sm:text-lg">
                         {item.price === 0 ? (
-                          <span className="text-[#00E096] text-sm">FREE</span>
+                          <span className="text-[#00E096] text-sm sm:text-base font-bold">FREE</span>
                         ) : (
                           `$${item.price.toFixed(2)}`
                         )}
                 </span>
                     </div>
                   </div>
+                  
+                  {/* Metadata */}
+                  <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 mb-1.5 sm:mb-2">
+                    <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded-full bg-muted text-muted-foreground capitalize font-medium">
+                      {item.type}
+                    </span>
+                    {item.category && (
+                      <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded-full bg-muted text-muted-foreground">
+                        {item.category}
+                      </span>
+                    )}
+                    {item.quantity && item.quantity > 1 && (
+                      <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded-full bg-muted text-muted-foreground">
+                        Qty: {item.quantity}
+                      </span>
+                    )}
+                    {item.hours && item.hours > 0 && (
+                      <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded-full bg-orange-500/10 text-orange-400 font-medium">
+                        {item.hours}hr{item.hours > 1 ? 's' : ''}
+                      </span>
+                    )}
+                    {item.partNumber && (
+                      <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded-full bg-muted text-muted-foreground font-mono">
+                        #{item.partNumber}
+                      </span>
+                    )}
+                  </div>
+                  
+                  {/* Action Buttons */}
+                  <div className="flex items-center gap-1.5 sm:gap-2 pt-1.5 sm:pt-2 mt-1.5 sm:mt-2 border-t border-border">
+                    {item.type === 'labor' && (
+                      <button
+                        onClick={() => {
+                          setEditingItem(item);
+                          setShowEditLaborDialog(true);
+                        }}
+                        className="text-[10px] sm:text-xs text-muted-foreground hover:text-foreground flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-2 sm:py-1.5 rounded-md hover:bg-accent transition-colors font-medium min-h-[40px] sm:min-h-[36px] touch-manipulation"
+                      >
+                        <Edit2 size={12} className="sm:w-[13px] sm:h-[13px]" />
+                        <span>Edit</span>
+                      </button>
+                    )}
+                    <button
+                      onClick={() => {
+                        setInvoiceItems(prev => prev.map(i => {
+                          if (i.id === item.id) {
+                            const originalPrice = i.type === 'labor' ? (i.hours || 1) * 85 : (i.price || 0);
+                            const updated = { ...i, price: i.price === 0 ? originalPrice : 0 };
+                            
+                            // Send webhook update
+                            sendWebhookUpdate('item_made_free', updated, {
+                              jobNumber: '4092',
+                              customer: 'John Doe',
+                              vehicle: '2018 Ford Focus'
+                            }).catch(err => console.error('Webhook error:', err));
+                            
+                            return updated;
+                          }
+                          return i;
+                        }));
+                      }}
+                      className="text-[10px] sm:text-xs text-muted-foreground hover:text-[#00E096] flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-2 sm:py-1.5 rounded-md hover:bg-accent transition-colors font-medium min-h-[40px] sm:min-h-[36px] touch-manipulation"
+                    >
+                      <Gift size={12} className="sm:w-[13px] sm:h-[13px]" />
+                      <span>{item.price === 0 ? 'Restore' : 'Make Free'}</span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        // Send webhook update before removing
+                        sendWebhookUpdate('item_removed', item, {
+                          jobNumber: '4092',
+                          customer: 'John Doe',
+                          vehicle: '2018 Ford Focus'
+                        }).catch(err => console.error('Webhook error:', err));
+                        
+                        setInvoiceItems(prev => prev.filter(i => i.id !== item.id));
+                      }}
+                      className="text-[10px] sm:text-xs text-red-400 hover:text-red-500 flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-2 sm:py-1.5 rounded-md hover:bg-red-500/10 transition-colors font-medium ml-auto min-h-[40px] sm:min-h-[36px] touch-manipulation"
+                    >
+                      <X size={12} className="sm:w-[13px] sm:h-[13px]" />
+                      <span>Remove</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
           ))}
-          <div ref={invoiceEndRef} />
-        </div>
-      </div>
-
-      {/* --- SIMULATION CONTROLS (For Demo Purposes) --- */}
-      <div className="absolute bottom-0 w-full bg-card border-t border-border p-3 z-50 max-w-md">
-        <p className="text-[10px] text-muted-foreground mb-2 text-center uppercase tracking-widest">Simulation Controls (Click to Speak)</p>
-        <div className="flex gap-2 overflow-x-auto pb-2">
-            <SimButton 
-                label="Checking..." 
-                onClick={() => handleVoiceInput("Checking the engine bay...", "none")} 
-            />
-            <SimButton 
-                label="+ Mount ($45)" 
-                color="blue"
-                onClick={() => handleVoiceInput("Installing new engine mount. $45 part.", "add_item", {name: "Engine Mount", price: 45, type: "part"})} 
-            />
-            <SimButton 
-                label="+ Labor" 
-                color="orange"
-                onClick={() => handleVoiceInput("Adding one hour of labor.", "add_labor")} 
-            />
-            <SimButton 
-                label="Remove Last" 
-                color="red"
-                onClick={() => handleVoiceInput("Actually, remove that last part.", "remove_last")} 
-            />
-             <SimButton 
-                label="Make Free" 
-                color="green"
-                onClick={() => handleVoiceInput("Don't charge for that.", "make_free")} 
-            />
-            <SimButton 
-                label="Finish Job" 
-                color="white"
-                onClick={() => handleVoiceInput("Okay, I'm done with the job.", "finish")} 
-            />
+            <div ref={invoiceEndRef} />
+          </div>
         </div>
       </div>
 
@@ -1496,7 +1728,7 @@ const Agent = () => {
       <button
         onClick={toggleRecording}
         disabled={isTranscribing}
-        className={`fixed bottom-20 left-1/2 -translate-x-1/2 z-50 w-16 h-16 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 transform hover:scale-110 active:scale-95 ${
+        className={`fixed bottom-4 sm:bottom-6 left-1/2 -translate-x-1/2 z-50 w-16 h-16 sm:w-20 sm:h-20 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 transform hover:scale-110 active:scale-95 touch-manipulation ${
           isRecording
             ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse'
             : 'bg-[#7c4dff] hover:bg-[#6d3fef] text-white'
@@ -1506,33 +1738,273 @@ const Agent = () => {
         {isRecording ? (
           <div className="relative">
             <div className="absolute inset-0 rounded-full bg-red-500 animate-ping opacity-75"></div>
-            <Pause size={24} className="relative z-10" fill="currentColor" />
+            <Pause size={24} className="relative z-10 sm:w-7 sm:h-7" fill="currentColor" />
           </div>
         ) : (
-          <Mic size={24} />
+          <Mic size={24} className="sm:w-7 sm:h-7" />
         )}
       </button>
+
+      {/* Add Labor Dialog */}
+      <Dialog open={showAddLaborDialog} onOpenChange={setShowAddLaborDialog}>
+        <DialogContent className="max-w-md mx-4 sm:mx-auto">
+          <DialogHeader>
+            <DialogTitle>Add Labor Hours</DialogTitle>
+            <DialogDescription>
+              Add labor time with a description of the work performed
+            </DialogDescription>
+          </DialogHeader>
+          <AddLaborForm
+            onSave={(hours, description, price) => {
+              const laborItem = {
+                id: Date.now(),
+                name: `Labor (${hours} ${hours === 1 ? 'Hour' : 'Hours'})`,
+                price: price || hours * 85,
+                type: 'labor' as const,
+                hours: hours,
+                laborDescription: description,
+                description: description || `Labor for ${hours} ${hours === 1 ? 'hour' : 'hours'}`,
+                category: 'labor'
+              };
+              setInvoiceItems(prev => [...prev, laborItem]);
+              
+              // Send webhook update with transcript context
+              const transcriptText = transcript.map(t => t.text).join(' ');
+              sendWebhookUpdate('item_added', laborItem, {
+                jobNumber: '4092',
+                customer: 'John Doe',
+                vehicle: '2018 Ford Focus'
+              }, transcriptText).catch(err => console.error('Webhook error:', err));
+              
+              setShowAddLaborDialog(false);
+            }}
+            onCancel={() => setShowAddLaborDialog(false)}
+          />
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Labor Dialog */}
+      <Dialog open={showEditLaborDialog} onOpenChange={setShowEditLaborDialog}>
+        <DialogContent className="max-w-md mx-4">
+          <DialogHeader>
+            <DialogTitle>Edit Labor Entry</DialogTitle>
+            <DialogDescription>
+              Update the labor description or add more context
+            </DialogDescription>
+          </DialogHeader>
+          {editingItem && (
+            <EditLaborForm
+              item={editingItem}
+              onSave={(description) => {
+                setInvoiceItems(prev => prev.map(i => {
+                  if (i.id === editingItem.id) {
+                    const updated = { ...i, laborDescription: description, description: description || i.description };
+                    // Send webhook update with transcript context
+                    const transcriptText = transcript.map(t => t.text).join(' ');
+                    sendWebhookUpdate('labor_updated', updated, {
+                      jobNumber: '4092',
+                      customer: 'John Doe',
+                      vehicle: '2018 Ford Focus'
+                    }, transcriptText).catch(err => console.error('Webhook error:', err));
+                    return updated;
+                  }
+                  return i;
+                }));
+                setShowEditLaborDialog(false);
+                setEditingItem(null);
+              }}
+              onCancel={() => {
+                setShowEditLaborDialog(false);
+                setEditingItem(null);
+              }}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Manual Item Dialog */}
+      <Dialog open={showAddItemDialog} onOpenChange={setShowAddItemDialog}>
+        <DialogContent className="max-w-md mx-4">
+          <DialogHeader>
+            <DialogTitle>Add Item to Invoice</DialogTitle>
+            <DialogDescription>
+              Manually add a part, service, or other item
+            </DialogDescription>
+          </DialogHeader>
+          <AddItemForm
+            onSave={(itemData) => {
+              const newItem = {
+                id: Date.now(),
+                ...itemData,
+                type: itemData.type || 'part',
+              };
+              setInvoiceItems(prev => [...prev, newItem]);
+              
+              // Send webhook update with transcript context
+              const transcriptText = transcript.map(t => t.text).join(' ');
+              sendWebhookUpdate('item_added', newItem, {
+                jobNumber: '4092',
+                customer: 'John Doe',
+                vehicle: '2018 Ford Focus'
+              }, transcriptText).catch(err => console.error('Webhook error:', err));
+              
+              setShowAddItemDialog(false);
+            }}
+            onCancel={() => setShowAddItemDialog(false)}
+          />
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
 
-const SimButton = ({ label, onClick, color = "gray" }) => {
-    const colors = {
-        gray: "bg-secondary hover:bg-secondary/80 text-secondary-foreground",
-        blue: "bg-[#7c4dff] hover:bg-[#6d3fef] text-white",
-        orange: "bg-orange-600 hover:bg-orange-500 text-white",
-        red: "bg-red-600 hover:bg-red-500 text-white",
-        green: "bg-[#00E096] hover:bg-[#00c884] text-[#171821]",
-        white: "bg-foreground text-background hover:opacity-90"
-    };
+// Add Labor Form Component
+const AddLaborForm = ({ onSave, onCancel }: { onSave: (hours: number, description: string, price?: number) => void; onCancel: () => void }) => {
+  const [hours, setHours] = useState(1);
+  const [description, setDescription] = useState('');
+  const [price, setPrice] = useState(85);
+
+  return (
+    <div className="space-y-4 py-4">
+      <div className="space-y-2">
+        <Label htmlFor="hours">Hours</Label>
+        <Input
+          id="hours"
+          type="number"
+          min="0.5"
+          step="0.5"
+          value={hours}
+          onChange={(e) => {
+            const val = parseFloat(e.target.value) || 1;
+            setHours(val);
+            setPrice(val * 85);
+          }}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="description">Work Description</Label>
+        <Textarea
+          id="description"
+          placeholder="Describe what work was performed (e.g., 'Replaced engine mount and installed new brake pads')"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={3}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="price">Price per Hour</Label>
+        <Input
+          id="price"
+          type="number"
+          min="0"
+          step="1"
+          value={price / hours}
+          onChange={(e) => {
+            const rate = parseFloat(e.target.value) || 85;
+            setPrice(hours * rate);
+          }}
+        />
+        <p className="text-xs text-muted-foreground">Total: ${price.toFixed(2)}</p>
+        </div>
+      <DialogFooter>
+        <Button variant="outline" onClick={onCancel}>Cancel</Button>
+        <Button onClick={() => onSave(hours, description, price)}>Add Labor</Button>
+      </DialogFooter>
+    </div>
+  );
+};
+
+// Edit Labor Form Component
+const EditLaborForm = ({ item, onSave, onCancel }: { item: any; onSave: (description: string) => void; onCancel: () => void }) => {
+  const [description, setDescription] = useState(item.laborDescription || item.description || '');
+
+  return (
+    <div className="space-y-4 py-4">
+      <div className="space-y-2">
+        <Label htmlFor="edit-description">Work Description</Label>
+        <Textarea
+          id="edit-description"
+          placeholder="Describe what work was performed..."
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={4}
+        />
+        <p className="text-xs text-muted-foreground">
+          Add or update the description of work performed during this labor entry
+        </p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" onClick={onCancel}>Cancel</Button>
+        <Button onClick={() => onSave(description)}>Save Changes</Button>
+      </DialogFooter>
+    </div>
+  );
+};
+
+// Add Item Form Component
+const AddItemForm = ({ onSave, onCancel }: { onSave: (item: any) => void; onCancel: () => void }) => {
+  const [name, setName] = useState('');
+  const [price, setPrice] = useState(0);
+  const [type, setType] = useState<'part' | 'labor' | 'service'>('part');
+  const [description, setDescription] = useState('');
+
     return (
-        <button 
-            onClick={onClick}
-            className={`${colors[color]} text-xs px-3 py-2 rounded-lg whitespace-nowrap transition-colors font-medium`}
+    <div className="space-y-4 py-4">
+      <div className="space-y-2">
+        <Label htmlFor="item-name">Item Name</Label>
+        <Input
+          id="item-name"
+          placeholder="e.g., Engine Mount, Oil Change, Diagnostic"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="item-type">Type</Label>
+        <select
+          id="item-type"
+          value={type}
+          onChange={(e) => setType(e.target.value as 'part' | 'labor' | 'service')}
+          className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-            {label}
-        </button>
-    )
-}
+          <option value="part">Part</option>
+          <option value="service">Service</option>
+          <option value="labor">Labor</option>
+        </select>
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="item-price">Price</Label>
+        <Input
+          id="item-price"
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder="0.00"
+          value={price}
+          onChange={(e) => setPrice(parseFloat(e.target.value) || 0)}
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="item-description">Description (Optional)</Label>
+        <Textarea
+          id="item-description"
+          placeholder="Additional details about this item"
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={2}
+        />
+      </div>
+      <DialogFooter>
+        <Button variant="outline" onClick={onCancel}>Cancel</Button>
+        <Button 
+          onClick={() => onSave({ name, price, type, description: description || undefined })}
+          disabled={!name || price < 0}
+        >
+          Add Item
+        </Button>
+      </DialogFooter>
+    </div>
+  );
+};
 
 export default Agent;
