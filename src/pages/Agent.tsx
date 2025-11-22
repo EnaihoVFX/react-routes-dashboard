@@ -1,18 +1,34 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Mic, Play, Pause, CheckCircle, Trash2, Plus, Clock, Send, DollarSign, User, ShieldCheck, ArrowLeft, FileText, Mail } from 'lucide-react';
+import { Mic, Play, Pause, CheckCircle, Trash2, Plus, Clock, Send, DollarSign, User, ShieldCheck, ArrowLeft, FileText, Mail, Image as ImageIcon } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { extractInvoiceItemsWithAI } from '@/lib/openai-agent';
 
 const Agent = () => {
   // App States: 'start', 'working', 'summary', 'invoice-sent'
   const [view, setView] = useState('start');
   const [isListening, setIsListening] = useState(false);
   const [isAnimating, setIsAnimating] = useState(false);
+  const [isLoadingTranscript, setIsLoadingTranscript] = useState(false);
+  const [transcriptError, setTranscriptError] = useState(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [isProcessingAI, setIsProcessingAI] = useState(false);
   const navigate = useNavigate();
   
   // Data States
   const [transcript, setTranscript] = useState([]);
   const [invoiceItems, setInvoiceItems] = useState([]);
   const [customerStatus, setCustomerStatus] = useState("Waiting to start...");
+
+  // Audio recording refs
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const streamRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const processorRef = useRef(null);
+  const transcriptionIntervalRef = useRef(null);
+  const wsRef = useRef(null);
+  const isRecordingRef = useRef(false); // Use ref to avoid closure issues
 
   // Scroll refs to auto-scroll lists
   const transcriptEndRef = useRef(null);
@@ -26,6 +42,1013 @@ const Agent = () => {
   useEffect(() => {
     scrollToBottom();
   }, [transcript, invoiceItems]);
+
+  // Cleanup audio recording on unmount
+  useEffect(() => {
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (transcriptionIntervalRef.current) {
+        clearInterval(transcriptionIntervalRef.current);
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
+    };
+  }, []);
+
+  // Convert WebM blob to WAV format (simplified - for production, use a proper audio converter library)
+  const convertToWav = async (webmBlob) => {
+    // For now, try sending WebM directly - ElevenLabs may accept it
+    // If not, we'll need to use AudioContext to convert
+    try {
+      // Create an audio context to convert if needed
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const arrayBuffer = await webmBlob.arrayBuffer();
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      
+      // Convert to WAV
+      const wavBuffer = audioBufferToWav(audioBuffer);
+      return new Blob([wavBuffer], { type: 'audio/wav' });
+    } catch (error) {
+      console.warn('Could not convert to WAV, sending WebM:', error);
+      // Fallback: send as WebM or MP3
+      return webmBlob;
+    }
+  };
+
+  // Helper to convert AudioBuffer to WAV
+  const audioBufferToWav = (buffer) => {
+    const length = buffer.length;
+    const numberOfChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const arrayBuffer = new ArrayBuffer(44 + length * numberOfChannels * 2);
+    const view = new DataView(arrayBuffer);
+    
+    // WAV header
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+    
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + length * numberOfChannels * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numberOfChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numberOfChannels * 2, true);
+    view.setUint16(32, numberOfChannels * 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, length * numberOfChannels * 2, true);
+    
+    // Convert float samples to 16-bit PCM
+    let offset = 44;
+    for (let i = 0; i < length; i++) {
+      for (let channel = 0; channel < numberOfChannels; channel++) {
+        const sample = Math.max(-1, Math.min(1, buffer.getChannelData(channel)[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        offset += 2;
+      }
+    }
+    
+    return arrayBuffer;
+  };
+
+  // Transcribe audio using ElevenLabs STT API
+  const transcribeAudio = async (audioBlob) => {
+    const apiKey = import.meta.env.VITE_ELEVENLABS_API_KEY;
+    if (!apiKey) {
+      throw new Error('ElevenLabs API key not found. Please set VITE_ELEVENLABS_API_KEY in your environment variables.');
+    }
+
+    setIsTranscribing(true);
+    setTranscriptError(null);
+    
+    try {
+      // Try to convert to WAV, but fallback to original format
+      let audioFile = audioBlob;
+      try {
+        audioFile = await convertToWav(audioBlob);
+      } catch (conversionError) {
+        console.warn('Using original audio format:', conversionError);
+      }
+
+      const formData = new FormData();
+      formData.append('file', audioFile, audioFile.type === 'audio/wav' ? 'recording.wav' : 'recording.webm');
+      formData.append('model_id', 'scribe_v1');
+      formData.append('language_code', 'eng');
+      // Note: diarize and tag_audio_events might need to be boolean or omitted
+      // formData.append('diarize', 'false');
+      // formData.append('tag_audio_events', 'false');
+
+      console.log('Sending audio to STT API, size:', audioFile.size, 'type:', audioFile.type);
+
+      const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorData;
+        try {
+          errorData = JSON.parse(errorText);
+        } catch {
+          errorData = { detail: errorText || `HTTP ${response.status}: ${response.statusText}` };
+        }
+        console.error('STT API Error:', errorData);
+        
+        // Handle nested error objects (like {detail: {status: ..., message: ...}})
+        let errorMessage = '';
+        if (errorData.detail) {
+          if (typeof errorData.detail === 'object' && errorData.detail.message) {
+            errorMessage = errorData.detail.message;
+          } else if (typeof errorData.detail === 'string') {
+            errorMessage = errorData.detail;
+          } else {
+            errorMessage = JSON.stringify(errorData.detail);
+          }
+        } else if (errorData.message) {
+          errorMessage = errorData.message;
+        } else {
+          errorMessage = `HTTP ${response.status}: ${response.statusText}`;
+        }
+        
+        throw new Error(errorMessage);
+      }
+
+      const data = await response.json();
+      console.log('STT Response:', data);
+
+      // Parse the transcription response - ElevenLabs STT returns text directly or in a text field
+      const transcriptionText = data.text || data.transcription || data.transcript || JSON.stringify(data);
+      
+      if (transcriptionText && transcriptionText.trim().length > 0) {
+        const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const newTranscriptEntry = {
+          text: transcriptionText.trim(),
+          timestamp: timestamp,
+        };
+        
+        setTranscript(prev => [...prev, newTranscriptEntry]);
+        parseInvoiceItemsFromTranscript([newTranscriptEntry]).catch(error => {
+          console.error('Error parsing invoice items:', error);
+        });
+        updateCustomerStatusFromTranscript([newTranscriptEntry]);
+        
+        return transcriptionText;
+      } else {
+        throw new Error('No transcription text in response. Response: ' + JSON.stringify(data));
+      }
+    } catch (error) {
+      console.error('STT Error:', error);
+      let errorMessage = 'Unknown transcription error';
+      
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === 'string') {
+        errorMessage = error;
+      } else if (error && typeof error === 'object') {
+        errorMessage = JSON.stringify(error);
+      }
+      
+      setTranscriptError(`Transcription error: ${errorMessage}\n\nPossible issues:\n- API key may be invalid or account restricted\n- Free tier may be disabled (upgrade to paid plan)\n- Microphone permission not granted\n- Audio file too small or invalid format\n\nCheck browser console for details.`);
+      throw error;
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  // Real-time transcription using chunked recording
+  const startRealTimeTranscription = async () => {
+    const apiKey = import.meta.env.VITE_ELEVENLABS_API_KEY;
+    if (!apiKey) {
+      setTranscriptError('ElevenLabs API key not found. Please set VITE_ELEVENLABS_API_KEY in your environment variables.');
+      return;
+    }
+
+    try {
+      console.log('🎤 Requesting microphone access...');
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true,
+        }
+      });
+      console.log('✅ Microphone access granted');
+      streamRef.current = stream;
+
+      // Create audio context for processing
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 16000
+      });
+      audioContextRef.current = audioContext;
+      console.log('🎵 Audio context created, sample rate:', audioContext.sampleRate);
+
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      let audioBuffer = [];
+      const CHUNK_DURATION_MS = 1500; // Transcribe every 1.5 seconds for faster response
+      let lastTranscriptionTime = Date.now();
+      let chunkCount = 0;
+      const audioBufferRef = { current: audioBuffer }; // Use ref to access from stop function
+      const lastTranscriptionTimeRef = { current: lastTranscriptionTime }; // Store for cleanup
+
+      processor.onaudioprocess = async (e) => {
+        // Use ref instead of state to avoid closure issues
+        if (!isRecordingRef.current) {
+          return;
+        }
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        const audioLevel = Math.max(...Array.from(inputData).map(Math.abs));
+        
+        // Only buffer if there's actual audio (not just silence)
+        if (audioLevel > 0.01) {
+          audioBuffer.push(...Array.from(inputData));
+          audioBufferRef.current = audioBuffer; // Keep ref in sync
+          
+          // Log less frequently to avoid console spam
+          if (audioBuffer.length % 16384 === 0) {
+            console.log(`🔊 Audio detected, level: ${audioLevel.toFixed(3)}, buffer size: ${audioBuffer.length}`);
+          }
+        }
+
+        const now = Date.now();
+        const timeSinceLastTranscription = now - lastTranscriptionTime;
+        
+        if (timeSinceLastTranscription >= CHUNK_DURATION_MS && audioBuffer.length > 0) {
+          chunkCount++;
+          const samplesCount = audioBuffer.length;
+          const duration = (samplesCount / audioContext.sampleRate).toFixed(2);
+          console.log(`📤 Sending chunk #${chunkCount} for transcription (${samplesCount} samples, ${duration}s)`);
+          
+          lastTranscriptionTime = now;
+          lastTranscriptionTimeRef.current = now;
+          
+          // Convert Float32Array to WAV blob
+          const wavBlob = float32ArrayToWav([...audioBuffer], audioContext.sampleRate);
+          console.log(`📦 Created WAV blob: ${wavBlob.size} bytes`);
+          
+          // Clear buffer AFTER copying
+          audioBuffer = [];
+          audioBufferRef.current = audioBuffer;
+
+          // Transcribe in background (don't await to keep real-time)
+          transcribeAudioChunk(wavBlob).catch(error => {
+            console.error('❌ Chunk transcription error:', error);
+          });
+        }
+      };
+      
+      // Store buffer ref and context for cleanup
+      processorRef.current.audioBufferRef = audioBufferRef;
+      processorRef.current.audioContext = audioContext;
+      processorRef.current.lastTranscriptionTime = lastTranscriptionTimeRef;
+      processorRef.current.CHUNK_DURATION_MS = CHUNK_DURATION_MS;
+
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      console.log('🔗 Audio processor connected');
+
+      // Set recording state BEFORE setting up processor to avoid closure issues
+      isRecordingRef.current = true;
+      setIsRecording(true);
+      setIsListening(true);
+      setTranscriptError(null);
+      console.log('✅ Real-time transcription started');
+    } catch (error) {
+      console.error('❌ Error starting real-time transcription:', error);
+      setTranscriptError(`Recording error: ${error.message}. Please allow microphone access.`);
+      isRecordingRef.current = false;
+      setIsRecording(false);
+      setIsListening(false);
+      
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+    }
+  };
+
+  // Convert Float32Array to WAV blob
+  const float32ArrayToWav = (float32Array, sampleRate) => {
+    const length = float32Array.length;
+    const buffer = new ArrayBuffer(44 + length * 2);
+    const view = new DataView(buffer);
+    
+    const writeString = (offset, string) => {
+      for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+      }
+    };
+    
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + length * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, length * 2, true);
+    
+    let offset = 44;
+    for (let i = 0; i < length; i++) {
+      const sample = Math.max(-1, Math.min(1, float32Array[i]));
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+      offset += 2;
+    }
+    
+    return new Blob([buffer], { type: 'audio/wav' });
+  };
+
+  // Transcribe a single audio chunk (non-blocking)
+  const transcribeAudioChunk = async (audioBlob) => {
+    const apiKey = import.meta.env.VITE_ELEVENLABS_API_KEY;
+    if (!apiKey) {
+      console.warn('⚠️ No API key found');
+      return;
+    }
+    
+    if (audioBlob.size < 100) {
+      console.warn('⚠️ Audio blob too small:', audioBlob.size);
+      return; // Skip if too small
+    }
+
+    console.log(`🚀 Starting transcription for chunk (${audioBlob.size} bytes)`);
+    setIsTranscribing(true);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', audioBlob, 'chunk.wav');
+      formData.append('model_id', 'scribe_v1');
+      formData.append('language_code', 'eng');
+
+      console.log('📡 Sending to ElevenLabs API...');
+      const response = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
+        method: 'POST',
+        headers: {
+          'xi-api-key': apiKey,
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorData;
+        try {
+          errorData = JSON.parse(errorText);
+        } catch {
+          errorData = { detail: errorText };
+        }
+        
+        console.error('❌ Transcription failed:', response.status, errorData);
+        
+        // Only show error if it's not the account restriction (to avoid spam)
+        if (response.status === 401 && errorData.detail?.message?.includes('Free Tier')) {
+          setTranscriptError(`Account restriction: ${errorData.detail.message}`);
+          return;
+        }
+        
+        // Show first error, then just log subsequent ones
+        if (!transcriptError) {
+          setTranscriptError(`Transcription error: ${errorData.detail?.message || errorData.detail || 'Unknown error'}`);
+        }
+        return;
+      }
+
+      const data = await response.json();
+      console.log('✅ Transcription response:', data);
+      
+      const transcriptionText = data.text || data.transcription || data.transcript;
+      
+      if (transcriptionText && transcriptionText.trim().length > 0) {
+        console.log(`📝 Got transcription: "${transcriptionText.trim()}"`);
+        const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const newTranscriptEntry = {
+          text: transcriptionText.trim(),
+          timestamp: timestamp,
+        };
+        
+        setTranscript(prev => {
+          // Avoid duplicate entries
+          const lastEntry = prev[prev.length - 1];
+          if (lastEntry && lastEntry.text === newTranscriptEntry.text) {
+            console.log('⏭️ Skipping duplicate transcription');
+            return prev;
+          }
+          const updated = [...prev, newTranscriptEntry];
+          console.log(`✅ Added transcription. Total entries: ${updated.length}`);
+          
+          // Parse invoice items from the updated transcript (async, don't await)
+          parseInvoiceItemsFromTranscript(updated).catch(error => {
+            console.error('Error parsing invoice items:', error);
+          });
+          updateCustomerStatusFromTranscript(updated);
+          
+          return updated;
+        });
+      } else {
+        console.warn('⚠️ No transcription text in response:', data);
+      }
+    } catch (error) {
+      console.error('❌ Chunk transcription error:', error);
+      if (!transcriptError) {
+        setTranscriptError(`Transcription error: ${error.message}`);
+      }
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  // Start audio recording (legacy - now uses real-time)
+  const startRecording = async () => {
+    await startRealTimeTranscription();
+  };
+
+  // Stop audio recording
+  const stopRecording = () => {
+    console.log('🛑 Stopping recording...');
+    isRecordingRef.current = false;
+    
+    // Send any remaining audio buffer before stopping
+    if (processorRef.current && processorRef.current.audioBufferRef) {
+      const remainingBuffer = processorRef.current.audioBufferRef.current;
+      const context = processorRef.current.audioContext || audioContextRef.current;
+      const lastTime = processorRef.current.lastTranscriptionTime?.current || 0;
+      const chunkDuration = processorRef.current.CHUNK_DURATION_MS || 1500;
+      
+      // Send if we have at least 0.5 seconds of audio OR if enough time has passed since last transcription
+      const minSamples = (context?.sampleRate || 16000) * 0.5; // 0.5 seconds minimum
+      const timeSinceLast = Date.now() - lastTime;
+      
+      if (remainingBuffer && remainingBuffer.length > minSamples && context) {
+        console.log(`📤 Sending final chunk (${remainingBuffer.length} samples, ${(remainingBuffer.length / context.sampleRate).toFixed(2)}s)`);
+        const wavBlob = float32ArrayToWav([...remainingBuffer], context.sampleRate);
+        transcribeAudioChunk(wavBlob).catch(error => {
+          console.error('❌ Final chunk transcription error:', error);
+        });
+      } else if (timeSinceLast >= chunkDuration && remainingBuffer && remainingBuffer.length > 0 && context) {
+        // Even if short, send it if enough time has passed
+        console.log(`📤 Sending final short chunk (${remainingBuffer.length} samples)`);
+        const wavBlob = float32ArrayToWav([...remainingBuffer], context.sampleRate);
+        transcribeAudioChunk(wavBlob).catch(error => {
+          console.error('❌ Final chunk transcription error:', error);
+        });
+      }
+    }
+    
+    // Stop audio processing
+    if (processorRef.current) {
+      try {
+        processorRef.current.disconnect();
+        processorRef.current = null;
+        console.log('✅ Processor disconnected');
+      } catch (error) {
+        console.error('Error disconnecting processor:', error);
+      }
+    }
+
+    // Close audio context (check state first)
+    if (audioContextRef.current) {
+      try {
+        if (audioContextRef.current.state !== 'closed') {
+          audioContextRef.current.close().then(() => {
+            console.log('✅ Audio context closed');
+          }).catch(error => {
+            console.error('Error closing audio context:', error);
+          });
+        }
+        audioContextRef.current = null;
+      } catch (error) {
+        console.error('Error closing audio context:', error);
+      }
+    }
+
+    // Stop media recorder if it exists
+    if (mediaRecorderRef.current) {
+      try {
+        if (mediaRecorderRef.current.state === 'recording') {
+          mediaRecorderRef.current.stop();
+        }
+      } catch (error) {
+        console.error('Error stopping MediaRecorder:', error);
+      }
+      mediaRecorderRef.current = null;
+    }
+
+    // Clear transcription interval
+    if (transcriptionIntervalRef.current) {
+      clearInterval(transcriptionIntervalRef.current);
+      transcriptionIntervalRef.current = null;
+    }
+
+    // Close WebSocket if open
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    
+    setIsRecording(false);
+    setIsListening(false);
+    
+    // Stop all tracks when explicitly stopping
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+  };
+
+  // Toggle recording
+  const toggleRecording = async () => {
+    // Prevent rapid toggling
+    if (isTranscribing) {
+      console.log('Transcription in progress, please wait...');
+      return;
+    }
+
+    if (isRecording) {
+      stopRecording();
+    } else {
+      await startRecording();
+    }
+  };
+
+  // Fetch transcript from ElevenLabs API (legacy - keeping for backward compatibility)
+  const fetchTranscript = async () => {
+    setIsLoadingTranscript(true);
+    try {
+      const apiKey = import.meta.env.VITE_ELEVENLABS_API_KEY;
+      if (!apiKey) {
+        setTranscriptError('ElevenLabs API key not found. Please set VITE_ELEVENLABS_API_KEY in your environment variables.');
+        setIsLoadingTranscript(false);
+        return;
+      }
+      
+      setTranscriptError(null);
+
+      // Try alternative endpoint paths - ElevenLabs API might use different paths
+      // Based on ElevenLabs API docs, transcripts can be accessed via different endpoints
+      const possibleEndpoints = [
+        `https://api.elevenlabs.io/v1/speech-to-text/${TRANSCRIPT_ID}`,
+        `https://api.elevenlabs.io/v1/speech-to-text/transcripts/${TRANSCRIPT_ID}`,
+        `https://api.elevenlabs.io/v1/speech-to-text/transcriptions/${TRANSCRIPT_ID}`,
+        `https://api.elevenlabs.io/v1/conversational-ai/transcripts/${TRANSCRIPT_ID}`,
+        `https://api.elevenlabs.io/v1/conversational-ai/conversations/${TRANSCRIPT_ID}/transcript`,
+        `https://api.elevenlabs.io/v1/conversational-ai/conversations/${TRANSCRIPT_ID}`,
+      ];
+
+      let response;
+      let lastError;
+      
+      for (const endpoint of possibleEndpoints) {
+        try {
+          console.log(`Trying endpoint: ${endpoint}`);
+          response = await fetch(endpoint, {
+            method: 'GET',
+            headers: {
+              'xi-api-key': apiKey,
+              'Content-Type': 'application/json',
+            },
+          });
+
+          console.log(`Response status: ${response.status} for ${endpoint}`);
+          
+          if (response.ok) {
+            console.log(`Success! Using endpoint: ${endpoint}`);
+            break; // Success, use this response
+          } else {
+            // Always log the error response body for debugging
+            try {
+              const errorBody = await response.clone().text();
+              console.log(`Error (${response.status}) for ${endpoint}:`, errorBody);
+              try {
+                const errorJson = JSON.parse(errorBody);
+                console.log('Parsed error JSON:', errorJson);
+              } catch (e) {
+                // Not JSON, that's fine
+              }
+            } catch (e) {
+              console.error('Could not read error body:', e);
+            }
+            
+            if (response.status !== 404) {
+              // If it's not a 404, this might be the right endpoint but there's another error
+              break;
+            }
+            // If 404, try next endpoint
+            console.log(`404 for ${endpoint}, trying next...`);
+          }
+        } catch (err) {
+          console.error(`Error fetching from ${endpoint}:`, err);
+          lastError = err;
+          continue;
+        }
+      }
+
+      // If all endpoints returned 404, try to get more info from the last response
+      if (!response || !response.ok) {
+        let errorText = 'Unknown error';
+        let errorData = null;
+        
+        if (response) {
+          try {
+            errorText = await response.text();
+            if (errorText && errorText.trim().startsWith('{')) {
+              errorData = JSON.parse(errorText);
+              console.log('Error response data:', errorData);
+            }
+          } catch (e) {
+            console.error('Could not parse error response:', e);
+          }
+        }
+        
+        // Try one more thing - maybe we need to list conversations first to find the right one
+        console.log('All transcript endpoints failed. Trying to list conversations...');
+        
+        try {
+          const listResponse = await fetch(
+            'https://api.elevenlabs.io/v1/conversational-ai/conversations',
+            {
+              method: 'GET',
+              headers: {
+                'xi-api-key': apiKey,
+                'Content-Type': 'application/json',
+              },
+            }
+          );
+          
+          if (listResponse.ok) {
+            const conversations = await listResponse.json();
+            console.log('Available conversations:', conversations);
+            
+            // Try to find our conversation ID in the list
+            const foundConversation = conversations.conversations?.find(
+              conv => conv.conversation_id === TRANSCRIPT_ID || conv.id === TRANSCRIPT_ID
+            );
+            
+            if (foundConversation) {
+              console.log('Found conversation:', foundConversation);
+              // Try to get this conversation's transcript
+              const convResponse = await fetch(
+                `https://api.elevenlabs.io/v1/conversational-ai/conversations/${foundConversation.conversation_id || foundConversation.id}`,
+                {
+                  method: 'GET',
+                  headers: {
+                    'xi-api-key': apiKey,
+                    'Content-Type': 'application/json',
+                  },
+                }
+              );
+              
+              if (convResponse.ok) {
+                const convData = await convResponse.json();
+                console.log('Conversation data:', convData);
+                
+                // Parse transcript from conversation data
+                if (convData.transcript || convData.messages || convData.history) {
+                  response = convResponse;
+                  // Continue to data parsing below
+                }
+              }
+            }
+          }
+        } catch (listErr) {
+          console.error('Failed to list conversations:', listErr);
+        }
+        
+        // If we still don't have a successful response, throw error
+        if (!response || !response.ok) {
+          let errorMessage = `Failed to fetch transcript: ${response?.status || 'Network Error'} ${response?.statusText || ''}`;
+          
+          if (errorData) {
+            if (errorData.detail || errorData.message) {
+              errorMessage += ` - ${errorData.detail || errorData.message}`;
+            }
+          } else if (errorText && errorText !== 'Unknown error') {
+            errorMessage += ` - ${errorText.substring(0, 200)}`;
+          }
+          
+          // Add helpful debugging info
+          console.error('Failed endpoints:', possibleEndpoints);
+          console.error('API Key present:', !!apiKey);
+          console.error('Transcript ID:', TRANSCRIPT_ID);
+          console.error('Error details:', { errorData, errorText });
+          
+          throw new Error(`${errorMessage}\n\nTried endpoints:\n${possibleEndpoints.map((e, i) => `${i + 1}. ${e}`).join('\n')}\n\nPlease check:\n1. Your API key has access to this transcript\n2. The transcript ID is correct\n3. The transcript exists in your ElevenLabs account\n4. Check browser console for detailed logs`);
+        }
+      }
+
+      const data = await response.json();
+      console.log('Successfully fetched data:', data);
+      
+      // Parse the transcript data - handle different response formats
+      let transcriptData = data;
+      
+      // If it's a conversation response, extract transcript/messages
+      if (data.messages && !data.words) {
+        console.log('Parsing messages from conversation:', data.messages);
+        // Convert messages to transcript format
+        const messages = Array.isArray(data.messages) ? data.messages : [];
+        const transcriptText = messages
+          .map(msg => msg.text || msg.content || msg.message || msg.transcript_text)
+          .filter(Boolean)
+          .join(' ');
+        
+        if (transcriptText) {
+          transcriptData = {
+            text: transcriptText,
+            words: messages
+              .filter(msg => msg.text || msg.content || msg.message || msg.transcript_text)
+              .flatMap((msg, idx) => {
+                const text = msg.text || msg.content || msg.message || msg.transcript_text;
+                // Split into words if needed
+                const words = text.split(/\s+/).filter(w => w.length > 0);
+                const startTime = msg.timestamp || msg.start_time || msg.created_at || idx;
+                return words.map((word, wordIdx) => ({
+                  text: word.replace(/[.,!?]/g, ''),
+                  start: startTime + (wordIdx * 0.5),
+                  end: startTime + ((wordIdx + 1) * 0.5),
+                }));
+              })
+          };
+        }
+      } else if (data.transcript && typeof data.transcript === 'string') {
+        // If transcript is just a string
+        transcriptData = {
+          text: data.transcript,
+          words: data.transcript.split(/\s+/).map((word, idx) => ({
+            text: word.replace(/[.,!?]/g, ''),
+            start: idx * 0.5,
+            end: (idx + 1) * 0.5,
+          }))
+        };
+      } else if (data.history && Array.isArray(data.history)) {
+        // If transcript is in history array
+        const transcriptText = data.history
+          .map(item => item.text || item.content || item.message)
+          .filter(Boolean)
+          .join(' ');
+        
+        transcriptData = {
+          text: transcriptText,
+          words: data.history
+            .filter(item => item.text || item.content || item.message)
+            .flatMap((item, idx) => {
+              const text = item.text || item.content || item.message;
+              const words = text.split(/\s+/).filter(w => w.length > 0);
+              const startTime = item.timestamp || item.start_time || idx;
+              return words.map((word, wordIdx) => ({
+                text: word.replace(/[.,!?]/g, ''),
+                start: startTime + (wordIdx * 0.5),
+                end: startTime + ((wordIdx + 1) * 0.5),
+              }));
+            })
+        };
+      }
+      
+      // Parse the transcript data
+      if (transcriptData.words && transcriptData.words.length > 0) {
+        // Group words into sentences/phrases by time gaps or pauses
+        const parsedTranscript = [];
+        let currentPhrase = [];
+        let lastEndTime = 0;
+
+        transcriptData.words.forEach((word, index) => {
+          // If there's a significant gap (>1 second), start a new phrase
+          if (currentPhrase.length > 0 && word.start - lastEndTime > 1.0) {
+            parsedTranscript.push({
+              text: currentPhrase.map(w => w.text).join(' '),
+              timestamp: formatTimestamp(currentPhrase[0].start),
+            });
+            currentPhrase = [];
+          }
+
+          currentPhrase.push(word);
+          lastEndTime = word.end;
+
+          // Also create a phrase if we hit a sentence-ending punctuation
+          if (word.text.match(/[.!?]$/) && index < data.words.length - 1) {
+            parsedTranscript.push({
+              text: currentPhrase.map(w => w.text).join(' '),
+              timestamp: formatTimestamp(currentPhrase[0].start),
+            });
+            currentPhrase = [];
+          }
+        });
+
+        // Add remaining words
+        if (currentPhrase.length > 0) {
+          parsedTranscript.push({
+            text: currentPhrase.map(w => w.text).join(' '),
+            timestamp: formatTimestamp(currentPhrase[0].start),
+          });
+        }
+
+        setTranscript(parsedTranscript);
+        
+        // Auto-parse invoice items from transcript
+        parseInvoiceItemsFromTranscript(parsedTranscript).catch(error => {
+          console.error('Error parsing invoice items:', error);
+        });
+        
+        // Update customer status based on transcript content
+        updateCustomerStatusFromTranscript(parsedTranscript);
+      } else if (transcriptData.text) {
+        // Fallback: if no words array, use the full text as a single entry
+        const fallbackTranscript = [{
+          text: transcriptData.text,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        }];
+        setTranscript(fallbackTranscript);
+        parseInvoiceItemsFromTranscript(fallbackTranscript).catch(error => {
+          console.error('Error parsing invoice items:', error);
+        });
+        updateCustomerStatusFromTranscript(fallbackTranscript);
+      } else {
+        // If we got data but can't parse it, log it and show error
+        console.error('Could not parse transcript data. Received:', transcriptData);
+        setTranscriptError(
+          `Received data but could not parse transcript format.\n` +
+          `Please check browser console for the received data structure.\n` +
+          `Received data type: ${typeof transcriptData}\n` +
+          `Keys: ${Object.keys(transcriptData || {}).join(', ')}`
+        );
+      }
+    } catch (error) {
+      console.error('Error fetching transcript:', error);
+      const errorMsg = error.message || 'Unknown error';
+      setTranscriptError(
+        `Failed to load transcript: ${errorMsg}\n\n` +
+        `Troubleshooting steps:\n` +
+        `1. Open browser console (F12) to see detailed endpoint attempts\n` +
+        `2. Verify your API key is correct: ${import.meta.env.VITE_ELEVENLABS_API_KEY ? 'Key is set (check if valid)' : 'Key is NOT set'}\n` +
+        `3. Verify transcript ID exists in your ElevenLabs account\n` +
+        `4. Check ElevenLabs API docs for the correct endpoint format\n` +
+        `5. Ensure your API key has permission to access this transcript`
+      );
+    } finally {
+      setIsLoadingTranscript(false);
+    }
+  };
+
+  // Auto-parse invoice items from transcript text using OpenAI
+  const parseInvoiceItemsFromTranscript = async (transcriptItems) => {
+    const text = transcriptItems.map(t => t.text).join(' ');
+    
+    // Only process if we have meaningful content
+    if (!text || text.trim().length < 10) {
+      return;
+    }
+
+    // Debounce: Only process every 5 seconds to avoid too many API calls
+    const now = Date.now();
+    if (parseInvoiceItemsFromTranscript.lastProcessed && 
+        now - parseInvoiceItemsFromTranscript.lastProcessed < 5000) {
+      return;
+    }
+    parseInvoiceItemsFromTranscript.lastProcessed = now;
+
+    setIsProcessingAI(true);
+    
+    try {
+      console.log('🤖 Processing transcript with OpenAI...');
+      const items = await extractInvoiceItemsWithAI(text);
+      
+      if (items && items.length > 0) {
+        console.log('✅ Extracted items:', items);
+        
+        // Merge with existing items, avoiding duplicates
+        setInvoiceItems(prev => {
+          const existingNames = new Set(prev.map(item => item.name.toLowerCase()));
+          const newItems = items.filter(item => !existingNames.has(item.name.toLowerCase()));
+          
+          if (newItems.length > 0) {
+            return [...prev, ...newItems];
+          }
+          return prev;
+        });
+      } else {
+        console.log('ℹ️ No items extracted from transcript');
+      }
+    } catch (error) {
+      console.error('❌ Error processing with AI:', error);
+      // Fallback to basic parsing if AI fails
+      parseInvoiceItemsBasic(transcriptItems);
+    } finally {
+      setIsProcessingAI(false);
+    }
+  };
+
+  // Fallback basic parsing (original logic)
+  const parseInvoiceItemsBasic = (transcriptItems) => {
+    const items = [];
+    const text = transcriptItems.map(t => t.text).join(' ').toLowerCase();
+    
+    // Look for price patterns: $XX, $XX.XX, or "XX dollars"
+    const pricePattern = /\$?(\d+)(?:\.(\d{2}))?/g;
+    const priceMatches = [...text.matchAll(pricePattern)];
+    
+    // Look for common part/service mentions
+    const partKeywords = ['mount', 'part', 'component', 'filter', 'belt', 'brake', 'tire', 'battery'];
+    const laborKeywords = ['labor', 'hour', 'hr', 'service', 'work', 'time'];
+    
+    priceMatches.forEach((match, index) => {
+      const price = parseFloat(match[1] + (match[2] ? '.' + match[2] : '.00'));
+      const matchIndex = text.indexOf(match[0]);
+      const contextBefore = text.substring(Math.max(0, matchIndex - 50), matchIndex);
+      const contextAfter = text.substring(matchIndex, Math.min(text.length, matchIndex + 50));
+      const context = contextBefore + contextAfter;
+      
+      // Check if it's labor
+      if (laborKeywords.some(keyword => context.includes(keyword))) {
+        items.push({
+          id: Date.now() + index,
+          name: 'Labor (1 Hour)',
+          price: price || 85,
+          type: 'labor'
+        });
+      } else if (partKeywords.some(keyword => context.includes(keyword))) {
+        // Try to extract part name from context
+        const partNameMatch = context.match(/new\s+([a-z\s]+?)(?:\s+\$|\s+price|\s+cost|$)/i);
+        const partName = partNameMatch ? partNameMatch[1].trim() : 'Part';
+        items.push({
+          id: Date.now() + index,
+          name: partName.charAt(0).toUpperCase() + partName.slice(1),
+          price: price,
+          type: 'part'
+        });
+      } else if (price > 10 && price < 1000) {
+        // Generic item if price is reasonable
+        items.push({
+          id: Date.now() + index,
+          name: 'Service Item',
+          price: price,
+          type: 'part'
+        });
+      }
+    });
+    
+    // Remove duplicates and set invoice items
+    if (items.length > 0) {
+      setInvoiceItems(prev => {
+        const existingNames = new Set(prev.map(item => item.name.toLowerCase()));
+        const newItems = items.filter(item => !existingNames.has(item.name.toLowerCase()));
+        return newItems.length > 0 ? [...prev, ...newItems] : prev;
+      });
+    }
+  };
+
+  // Update customer status based on transcript content
+  const updateCustomerStatusFromTranscript = (transcriptItems) => {
+    const fullText = transcriptItems.map(t => t.text).join(' ').toLowerCase();
+    
+    if (fullText.includes('checking') || fullText.includes('diagnosing')) {
+      setCustomerStatus("Technician is diagnosing the issue...");
+    } else if (fullText.includes('installing') || fullText.includes('replacing')) {
+      setCustomerStatus("Technician is replacing parts...");
+    } else if (fullText.includes('done') || fullText.includes('finished') || fullText.includes('complete')) {
+      setCustomerStatus("Job completed");
+    } else if (transcriptItems.length > 0) {
+      setCustomerStatus("Technician is working...");
+    }
+  };
+
+  // Helper function to format timestamp from seconds
+  const formatTimestamp = (seconds) => {
+    const date = new Date(0);
+    date.setSeconds(seconds);
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  };
+
+  // Auto-start recording when entering working view (optional - can be removed if manual start preferred)
+  // useEffect(() => {
+  //   if (view === 'working' && !isRecording && !streamRef.current) {
+  //     setTimeout(() => startRecording(), 500);
+  //   }
+  //   // eslint-disable-next-line react-hooks/exhaustive-deps
+  // }, [view]);
 
   // --- SIMULATION LOGIC (The "AI" Brain) ---
   const handleVoiceInput = (text, actionType, data) => {
@@ -67,23 +1090,28 @@ const Agent = () => {
   // --- VIEW: 1. START JOB ---
   if (view === 'start') {
     return (
-      <div className="min-h-screen bg-[#171821] text-white flex flex-col items-center justify-center p-4 sm:p-6 font-sans max-w-md mx-auto relative overflow-hidden">
+      <div className="min-h-screen bg-background text-foreground flex flex-col items-center justify-center p-4 sm:p-6 font-sans max-w-md mx-auto relative overflow-hidden">
         {/* Background Elements */}
-        <div className="absolute top-0 left-0 w-full h-full bg-gradient-to-b from-[#7c4dff]/20 to-[#171821] z-0"></div>
+        <div className="absolute top-0 left-0 w-full h-full bg-gradient-to-b from-[#7c4dff]/20 to-background z-0"></div>
         
         <div className="z-10 flex flex-col items-center text-center">
           <div className="w-24 h-24 bg-[#7c4dff] rounded-full flex items-center justify-center mb-8 shadow-[0_0_30px_rgba(124,77,255,0.5)] animate-pulse">
             <Mic size={40} className="text-white" />
           </div>
           <h1 className="text-2xl sm:text-3xl font-bold mb-2">Job #4092</h1>
-          <p className="text-gray-400 mb-8 text-sm sm:text-base">Customer: John Doe • 2018 Ford Focus</p>
+          <p className="text-muted-foreground mb-8 text-sm sm:text-base">Customer: John Doe • 2018 Ford Focus</p>
           
           <button 
-            onClick={() => { setView('working'); setIsListening(true); }}
-            className="bg-white text-[#171821] px-8 py-4 rounded-2xl font-bold text-base sm:text-lg flex items-center gap-2 hover:scale-105 transition-transform"
+            onClick={() => { 
+              setView('working'); 
+              // Start recording automatically when entering working view
+              setTimeout(() => startRecording(), 500);
+            }}
+            className="bg-foreground text-background px-8 py-4 rounded-2xl font-bold text-base sm:text-lg flex items-center gap-2 hover:scale-105 transition-transform disabled:opacity-50 disabled:cursor-not-allowed"
+            disabled={isLoadingTranscript}
           >
             <Play size={20} fill="currentColor" />
-            Start Job with AI
+            {isLoadingTranscript ? 'Loading...' : 'Start Real-Time Transcription'}
           </button>
         </div>
       </div>
@@ -93,55 +1121,78 @@ const Agent = () => {
   // --- VIEW: 3. SUMMARY (FINISH) ---
   if (view === 'summary') {
     return (
-      <div className="min-h-screen bg-[#171821] text-white p-4 sm:p-6 font-sans max-w-md mx-auto flex flex-col">
+      <div className="min-h-screen bg-background text-foreground p-4 sm:p-6 font-sans max-w-md mx-auto flex flex-col">
         <header className="mb-6">
           <h1 className="text-xl sm:text-2xl font-bold text-[#00E096] flex items-center gap-2">
             <CheckCircle /> Job Complete
           </h1>
-          <p className="text-gray-400 text-sm">Review Invoice Draft</p>
+          <p className="text-muted-foreground text-sm">Review Invoice Draft</p>
         </header>
 
-        <div className="flex-1 bg-[#21222D] rounded-2xl p-4 sm:p-6 mb-4 overflow-y-auto">
-          <h2 className="text-base sm:text-lg font-semibold mb-4 border-b border-[#2b2c3b] pb-2">Invoice Summary</h2>
+        <div className="flex-1 bg-card rounded-2xl p-4 sm:p-6 mb-4 overflow-y-auto border border-border">
+          <h2 className="text-base sm:text-lg font-semibold mb-4 border-b border-border pb-2">Invoice Summary</h2>
           
           {invoiceItems.length === 0 ? (
-            <div className="border-2 border-dashed border-[#2b2c3b] rounded-xl h-32 flex items-center justify-center text-gray-600 text-sm">
+            <div className="border-2 border-dashed border-border rounded-xl h-32 flex items-center justify-center text-muted-foreground text-sm">
               No items recorded.
             </div>
           ) : (
             <>
               <div className="space-y-3 mb-6">
                 {invoiceItems.map((item) => (
-                  <div key={item.id} className="bg-[#171821] border border-[#2b2c3b] p-4 rounded-xl flex justify-between items-center">
-                    <div className="flex items-center gap-3 flex-1">
-                      <div className={`p-2 rounded-lg ${item.type === 'part' ? 'bg-[#7c4dff]/20 text-[#7c4dff]' : 'bg-orange-500/20 text-orange-400'}`}>
+                  <div key={item.id} className="bg-background border border-border p-4 rounded-xl">
+                    <div className="flex items-start gap-3">
+                      {item.imageUrl ? (
+                        <img 
+                          src={item.imageUrl} 
+                          alt={item.name}
+                          className="w-16 h-16 object-cover rounded-lg border border-border shrink-0"
+                          onError={(e) => {
+                            e.currentTarget.style.display = 'none';
+                          }}
+                        />
+                      ) : (
+                        <div className={`p-2 rounded-lg shrink-0 ${item.type === 'part' ? 'bg-[#7c4dff]/20 text-[#7c4dff]' : 'bg-orange-500/20 text-orange-400'}`}>
                         {item.type === 'part' ? <Plus size={18}/> : <Clock size={18}/>}
                       </div>
-                      <div className="flex-1">
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex-1 min-w-0">
                         <h4 className="font-medium text-sm sm:text-base">{item.name}</h4>
-                        <p className="text-xs text-gray-400 capitalize">{item.type}</p>
+                            {item.description && (
+                              <p className="text-xs text-muted-foreground mt-0.5">{item.description}</p>
+                            )}
+                            <div className="flex items-center gap-2 mt-1">
+                        <p className="text-xs text-muted-foreground capitalize">{item.type}</p>
+                              {item.category && (
+                                <span className="text-xs text-muted-foreground">• {item.category}</span>
+                              )}
                       </div>
                     </div>
-                    <div className="text-right ml-3">
+                          <div className="text-right shrink-0">
                       <span className="font-bold text-lg">
                         {item.price === 0 ? (
                           <span className="text-[#00E096] text-sm">FREE</span>
                         ) : (
-                          `$${item.price}`
+                                `$${item.price.toFixed(2)}`
                         )}
                       </span>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 ))}
               </div>
               
-              <div className="pt-4 border-t border-[#2b2c3b]">
+              <div className="pt-4 border-t border-border">
                 <div className="flex justify-between items-center mb-2">
-                  <span className="text-gray-400 text-sm">Items: {invoiceItems.length}</span>
-                  <span className="text-gray-400 text-sm">Subtotal: ${total}</span>
+                  <span className="text-muted-foreground text-sm">Items: {invoiceItems.length}</span>
+                  <span className="text-muted-foreground text-sm">Subtotal: ${total}</span>
                 </div>
                 <div className="flex justify-between items-end pt-2">
-                  <span className="text-gray-300 text-base sm:text-lg font-semibold">Total Due</span>
+                  <span className="text-muted-foreground text-base sm:text-lg font-semibold">Total Due</span>
                   <span className="text-2xl sm:text-3xl font-bold text-[#7c4dff]">${total}</span>
                 </div>
               </div>
@@ -150,9 +1201,9 @@ const Agent = () => {
         </div>
 
         <div className="grid grid-cols-2 gap-4">
-          <button className="bg-[#21222D] py-3 rounded-xl font-medium text-sm sm:text-base" onClick={() => setView('working')}>Resume Work</button>
+          <button className="bg-card border border-border py-3 rounded-xl font-medium text-sm sm:text-base hover:bg-accent hover:text-accent-foreground transition-colors" onClick={() => setView('working')}>Resume Work</button>
           <button 
-            className="bg-[#7c4dff] py-3 rounded-xl font-medium text-sm sm:text-base flex items-center justify-center gap-2 hover:bg-[#6d3fef] transition-colors"
+            className="bg-[#7c4dff] py-3 rounded-xl font-medium text-sm sm:text-base flex items-center justify-center gap-2 hover:bg-[#6d3fef] transition-colors text-white"
             onClick={() => {
               setIsAnimating(true);
               setTimeout(() => {
@@ -174,22 +1225,22 @@ const Agent = () => {
     const currentDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
     
     return (
-      <div className={`min-h-screen bg-[#171821] text-white p-4 sm:p-6 font-sans max-w-md mx-auto flex flex-col ${isAnimating ? 'animate-fade-out' : 'animate-fade-in'}`}>
+      <div className={`min-h-screen bg-background text-foreground p-4 sm:p-6 font-sans max-w-md mx-auto flex flex-col ${isAnimating ? 'animate-fade-out' : 'animate-fade-in'}`}>
         {/* Success Animation Header */}
         <div className="flex flex-col items-center justify-center mb-8 mt-8">
           <div className="relative mb-6">
             <div className="w-24 h-24 bg-[#00E096] rounded-full flex items-center justify-center animate-scale-in shadow-[0_0_40px_rgba(0,224,150,0.5)]">
-              <CheckCircle size={48} className="text-[#171821]" />
+              <CheckCircle size={48} className="text-background" />
             </div>
             <div className="absolute inset-0 bg-[#00E096] rounded-full animate-ping opacity-20"></div>
           </div>
           <h1 className="text-2xl sm:text-3xl font-bold text-[#00E096] mb-2">Invoice Sent!</h1>
-          <p className="text-gray-400 text-sm sm:text-base text-center">Invoice #{invoiceNumber} has been sent to the customer</p>
+          <p className="text-muted-foreground text-sm sm:text-base text-center">Invoice #{invoiceNumber} has been sent to the customer</p>
         </div>
 
         {/* Invoice Details Card */}
-        <div className="flex-1 bg-[#21222D] rounded-2xl p-4 sm:p-6 mb-6 animate-slide-up">
-          <div className="flex items-center gap-2 mb-6 pb-4 border-b border-[#2b2c3b]">
+        <div className="flex-1 bg-card rounded-2xl p-4 sm:p-6 mb-6 animate-slide-up border border-border">
+          <div className="flex items-center gap-2 mb-6 pb-4 border-b border-border">
             <FileText className="text-[#7c4dff]" size={20} />
             <h2 className="text-lg sm:text-xl font-bold">Invoice Details</h2>
           </div>
@@ -197,32 +1248,32 @@ const Agent = () => {
           {/* Invoice Info */}
           <div className="space-y-4 mb-6">
             <div className="flex justify-between items-center">
-              <span className="text-gray-400 text-sm">Invoice Number</span>
+              <span className="text-muted-foreground text-sm">Invoice Number</span>
               <span className="font-mono font-semibold">{invoiceNumber}</span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-gray-400 text-sm">Date</span>
+              <span className="text-muted-foreground text-sm">Date</span>
               <span className="font-medium">{currentDate}</span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-gray-400 text-sm">Customer</span>
+              <span className="text-muted-foreground text-sm">Customer</span>
               <span className="font-medium">John Doe</span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-gray-400 text-sm">Vehicle</span>
+              <span className="text-muted-foreground text-sm">Vehicle</span>
               <span className="font-medium">2018 Ford Focus</span>
             </div>
           </div>
 
           {/* Items List */}
           <div className="mb-6">
-            <h3 className="text-sm font-semibold text-gray-400 mb-3 uppercase">Items</h3>
+            <h3 className="text-sm font-semibold text-muted-foreground mb-3 uppercase">Items</h3>
             <div className="space-y-2">
               {invoiceItems.map((item, idx) => (
-                <div key={idx} className="flex justify-between items-center py-2 border-b border-[#2b2c3b] last:border-0">
+                <div key={idx} className="flex justify-between items-center py-2 border-b border-border last:border-0">
                   <div className="flex-1">
                     <p className="font-medium text-sm">{item.name}</p>
-                    <p className="text-xs text-gray-500 uppercase">{item.type}</p>
+                    <p className="text-xs text-muted-foreground uppercase">{item.type}</p>
                   </div>
                   <span className="font-mono font-semibold">
                     {item.price === 0 ? <span className="text-[#00E096] text-xs">FREE</span> : `$${item.price}`}
@@ -233,9 +1284,9 @@ const Agent = () => {
           </div>
 
           {/* Total */}
-          <div className="pt-4 border-t border-[#2b2c3b]">
+          <div className="pt-4 border-t border-border">
             <div className="flex justify-between items-end mb-2">
-              <span className="text-gray-400">Subtotal</span>
+              <span className="text-muted-foreground">Subtotal</span>
               <span className="font-mono">${total}</span>
             </div>
             <div className="flex justify-between items-end">
@@ -249,7 +1300,7 @@ const Agent = () => {
         <div className="space-y-3">
           <button 
             onClick={() => navigate('/dashboard')}
-            className="w-full bg-[#7c4dff] py-4 rounded-xl font-medium text-base flex items-center justify-center gap-2 hover:bg-[#6d3fef] transition-colors"
+            className="w-full bg-[#7c4dff] py-4 rounded-xl font-medium text-base flex items-center justify-center gap-2 hover:bg-[#6d3fef] transition-colors text-white"
           >
             <ArrowLeft size={20} />
             Back to Dashboard
@@ -261,7 +1312,7 @@ const Agent = () => {
               setInvoiceItems([]);
               setCustomerStatus("Waiting to start...");
             }}
-            className="w-full bg-[#21222D] py-3 rounded-xl font-medium text-sm hover:bg-[#2b2c3b] transition-colors"
+            className="w-full bg-card border border-border py-3 rounded-xl font-medium text-sm hover:bg-accent hover:text-accent-foreground transition-colors"
           >
             Start New Job
           </button>
@@ -272,34 +1323,55 @@ const Agent = () => {
 
   // --- VIEW: 2. LIVE WORK SCREEN (MAIN UI) ---
   return (
-    <div className="h-screen bg-[#171821] text-white font-sans flex flex-col relative max-w-md mx-auto">
+    <div className="h-screen bg-background text-foreground font-sans flex flex-col relative max-w-md mx-auto">
       
       {/* Header & Customer Status */}
-      <header className="bg-[#21222D]/50 backdrop-blur-md p-4 border-b border-[#2b2c3b] z-20 flex justify-between items-start">
-        <div>
+      <header className="bg-card/50 backdrop-blur-md p-4 border-b border-border z-20 flex justify-between items-start">
+        <div className="flex-1">
             <div className="flex items-center gap-2 mb-1">
-                <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
-                <span className="text-xs font-bold text-red-400 uppercase tracking-wider">Live Recording</span>
+                <div className={`w-2 h-2 rounded-full ${isRecording ? 'bg-red-500 animate-pulse' : 'bg-gray-400'}`}></div>
+                <span className="text-xs font-bold uppercase tracking-wider">
+                  {isRecording ? 'Live Transcribing...' : isTranscribing ? 'Processing...' : 'Ready'}
+                </span>
             </div>
             <div className="flex items-center gap-1.5 text-[#00E096] text-xs bg-[#00E096]/10 px-2 py-1 rounded-full border border-[#00E096]/20">
                 <ShieldCheck size={12} />
                 {customerStatus}
             </div>
         </div>
-        <button onClick={() => handleVoiceInput("I'm done.", 'finish')} className="text-xs bg-[#21222D] hover:bg-[#2b2c3b] px-3 py-1 rounded-lg">
+        <button onClick={() => handleVoiceInput("I'm done.", 'finish')} className="text-xs bg-card hover:bg-accent hover:text-accent-foreground px-3 py-1 rounded-lg border border-border transition-colors">
             End Job
         </button>
       </header>
 
       {/* TOP SECTION: TRANSCRIPT (35% Height) */}
-      <div className="flex-none h-[35%] bg-[#171821] p-4 overflow-y-auto border-b border-[#2b2c3b]">
-        <h3 className="text-gray-500 text-xs uppercase font-bold mb-2 sticky top-0 bg-[#171821] py-1">Live Transcript</h3>
+      <div className="flex-none h-[35%] bg-background p-4 overflow-y-auto border-b border-border">
+        <h3 className="text-muted-foreground text-xs uppercase font-bold mb-2 sticky top-0 bg-background py-1">Live Transcript</h3>
         <div className="space-y-3">
-          {transcript.length === 0 && <p className="text-gray-600 italic text-sm">Listening for activity...</p>}
+          {isTranscribing && (
+            <p className="text-muted-foreground italic text-sm">Transcribing audio with ElevenLabs STT...</p>
+          )}
+          {transcriptError && (
+            <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-3">
+              <p className="text-red-400 text-xs whitespace-pre-wrap">{transcriptError}</p>
+              <button 
+                onClick={() => setTranscriptError(null)} 
+                className="text-xs text-red-400 underline mt-2"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+          {!isTranscribing && !transcriptError && transcript.length === 0 && (
+            <div className="text-center py-8">
+              <Mic className="w-12 h-12 text-muted-foreground mx-auto mb-2 opacity-50" />
+              <p className="text-muted-foreground italic text-sm">Tap the floating button to start real-time transcription</p>
+            </div>
+          )}
           {transcript.map((t, i) => (
             <div key={i} className="animate-fade-in-up">
                <p className="text-[#7c4dff] text-sm leading-relaxed">"{t.text}"</p>
-               <span className="text-[10px] text-gray-600">{t.timestamp}</span>
+               <span className="text-[10px] text-muted-foreground">{t.timestamp}</span>
             </div>
           ))}
           <div ref={transcriptEndRef} />
@@ -307,34 +1379,76 @@ const Agent = () => {
       </div>
 
       {/* BOTTOM SECTION: INVOICE CARDS (Remaining Height) */}
-      <div className="flex-1 bg-[#171821] p-4 overflow-y-auto relative">
-        <div className="sticky top-0 z-10 bg-[#171821] pb-2 flex justify-between items-center">
-             <h3 className="text-gray-500 text-xs uppercase font-bold">Detected Items</h3>
-             <span className="text-[#7c4dff] text-sm font-bold">Total: ${total}</span>
+      <div className="flex-1 bg-background p-4 overflow-y-auto relative">
+        <div className="sticky top-0 z-10 bg-background pb-2 flex justify-between items-center">
+             <h3 className="text-muted-foreground text-xs uppercase font-bold">
+               Detected Items
+               {isProcessingAI && (
+                 <span className="ml-2 text-[#7c4dff] animate-pulse">🤖 AI Processing...</span>
+               )}
+             </h3>
+             <span className="text-[#7c4dff] text-sm font-bold">Total: ${total.toFixed(2)}</span>
         </div>
         
         <div className="space-y-3 pb-32"> 
           {invoiceItems.length === 0 && (
-             <div className="border-2 border-dashed border-[#2b2c3b] rounded-xl h-32 flex items-center justify-center text-gray-600 text-sm">
+             <div className="border-2 border-dashed border-border rounded-xl h-32 flex items-center justify-center text-muted-foreground text-sm">
                 Mention parts or labor to add items
              </div>
           )}
           
           {invoiceItems.map((item) => (
-            <div key={item.id} className="bg-[#21222D] border border-[#2b2c3b] p-4 rounded-xl flex justify-between items-center shadow-lg animate-slide-in-right">
-              <div className="flex items-center gap-3">
-                <div className={`p-2 rounded-lg ${item.type === 'part' ? 'bg-[#7c4dff]/20 text-[#7c4dff]' : 'bg-orange-500/20 text-orange-400'}`}>
+            <div key={item.id} className="bg-card border border-border p-4 rounded-xl shadow-lg animate-slide-in-right">
+              <div className="flex items-start gap-3">
+                {/* Image or Icon */}
+                {item.imageUrl ? (
+                  <img 
+                    src={item.imageUrl} 
+                    alt={item.name}
+                    className="w-16 h-16 object-cover rounded-lg border border-border"
+                    onError={(e) => {
+                      // Fallback to icon if image fails to load
+                      e.currentTarget.style.display = 'none';
+                    }}
+                  />
+                ) : (
+                  <div className={`p-2 rounded-lg shrink-0 ${item.type === 'part' ? 'bg-[#7c4dff]/20 text-[#7c4dff]' : 'bg-orange-500/20 text-orange-400'}`}>
                     {item.type === 'part' ? <Plus size={18}/> : <Clock size={18}/>}
                 </div>
-                <div>
+                )}
+                
+                {/* Item Details */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1 min-w-0">
                   <h4 className="font-medium text-sm">{item.name}</h4>
-                  <p className="text-xs text-gray-400 capitalize">{item.type}</p>
+                      {item.description && (
+                        <p className="text-xs text-muted-foreground mt-0.5">{item.description}</p>
+                      )}
+                      <div className="flex items-center gap-2 mt-1">
+                  <p className="text-xs text-muted-foreground capitalize">{item.type}</p>
+                        {item.category && (
+                          <span className="text-xs text-muted-foreground">• {item.category}</span>
+                        )}
+                        {item.quantity && item.quantity > 1 && (
+                          <span className="text-xs text-muted-foreground">• Qty: {item.quantity}</span>
+                        )}
                 </div>
+                      {item.partNumber && (
+                        <p className="text-xs text-muted-foreground mt-0.5">Part #: {item.partNumber}</p>
+                      )}
               </div>
-              <div className="text-right">
+                    <div className="text-right shrink-0">
                 <span className="font-bold text-lg">
-                    {item.price === 0 ? <span className="text-[#00E096] text-sm">FREE</span> : `$${item.price}`}
+                        {item.price === 0 ? (
+                          <span className="text-[#00E096] text-sm">FREE</span>
+                        ) : (
+                          `$${item.price.toFixed(2)}`
+                        )}
                 </span>
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           ))}
@@ -343,8 +1457,8 @@ const Agent = () => {
       </div>
 
       {/* --- SIMULATION CONTROLS (For Demo Purposes) --- */}
-      <div className="absolute bottom-0 w-full bg-[#21222D] border-t border-[#2b2c3b] p-3 z-50 max-w-md">
-        <p className="text-[10px] text-gray-400 mb-2 text-center uppercase tracking-widest">Simulation Controls (Click to Speak)</p>
+      <div className="absolute bottom-0 w-full bg-card border-t border-border p-3 z-50 max-w-md">
+        <p className="text-[10px] text-muted-foreground mb-2 text-center uppercase tracking-widest">Simulation Controls (Click to Speak)</p>
         <div className="flex gap-2 overflow-x-auto pb-2">
             <SimButton 
                 label="Checking..." 
@@ -377,18 +1491,39 @@ const Agent = () => {
             />
         </div>
       </div>
+
+      {/* Floating Record/Stop Button Overlay - Centered */}
+      <button
+        onClick={toggleRecording}
+        disabled={isTranscribing}
+        className={`fixed bottom-20 left-1/2 -translate-x-1/2 z-50 w-16 h-16 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 transform hover:scale-110 active:scale-95 ${
+          isRecording
+            ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse'
+            : 'bg-[#7c4dff] hover:bg-[#6d3fef] text-white'
+        } ${isTranscribing ? 'opacity-50 cursor-not-allowed' : ''}`}
+        aria-label={isRecording ? 'Stop recording' : 'Start recording'}
+      >
+        {isRecording ? (
+          <div className="relative">
+            <div className="absolute inset-0 rounded-full bg-red-500 animate-ping opacity-75"></div>
+            <Pause size={24} className="relative z-10" fill="currentColor" />
+          </div>
+        ) : (
+          <Mic size={24} />
+        )}
+      </button>
     </div>
   );
 };
 
 const SimButton = ({ label, onClick, color = "gray" }) => {
     const colors = {
-        gray: "bg-[#21222D] hover:bg-[#2b2c3b]",
-        blue: "bg-[#7c4dff] hover:bg-[#6d3fef]",
-        orange: "bg-orange-600 hover:bg-orange-500",
-        red: "bg-red-600 hover:bg-red-500",
+        gray: "bg-secondary hover:bg-secondary/80 text-secondary-foreground",
+        blue: "bg-[#7c4dff] hover:bg-[#6d3fef] text-white",
+        orange: "bg-orange-600 hover:bg-orange-500 text-white",
+        red: "bg-red-600 hover:bg-red-500 text-white",
         green: "bg-[#00E096] hover:bg-[#00c884] text-[#171821]",
-        white: "bg-white text-[#171821] hover:bg-gray-200"
+        white: "bg-foreground text-background hover:opacity-90"
     };
     return (
         <button 

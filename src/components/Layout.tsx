@@ -4,7 +4,7 @@ interface LayoutProps {
 
 export function Layout({ children }: LayoutProps) {
   return (
-    <div className="flex h-screen bg-[#171821]">
+    <div className="flex h-screen bg-background">
       {/* Main Content */}
       <main className="flex-1 overflow-auto">
         {children}
