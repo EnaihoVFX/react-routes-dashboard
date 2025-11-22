@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { 
   ChevronUp, 
   ChevronDown, 
@@ -6,16 +6,33 @@ import {
   LogOut, 
   User as UserIcon, 
   FileText,
-  Plus
+  Plus,
+  Bell
 } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer } from 'recharts';
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Badge } from "@/components/ui/badge";
 
 const Dashboard = () => {
   const navigate = useNavigate();
+  const [hasUnreadNotification, setHasUnreadNotification] = useState(true);
+  const [jobAccepted, setJobAccepted] = useState(false);
+
+  // Job notification data
+  const jobSummary = {
+    summary: "The user contacted Auto King Bethnal Green because their 2019 Ford Focus engine was smoking and smelled like oil. The agent gathered details about the car and the issue. The user is bringing the car in for assessment and provided the registration number AB12CDE. The agent advised caution while driving and confirmed they would be ready for the user's arrival."
+  };
+
+  const handleAcceptJob = () => {
+    setJobAccepted(true);
+    setHasUnreadNotification(false);
+    // Here you would typically handle the job acceptance logic
+    console.log("Job accepted");
+  };
 
   // Chart Data - Weekly Revenue (Car Garage)
   const chartData = [
@@ -103,7 +120,52 @@ const Dashboard = () => {
            </Button>
         </div>
         
-        <DropdownMenu>
+        <div className="flex items-center gap-2">
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button 
+                variant="ghost" 
+                size="icon" 
+                className="relative h-9 w-9 rounded-full text-muted-foreground hover:text-foreground hover:bg-accent"
+              >
+                <Bell className="h-5 w-5" />
+                {hasUnreadNotification && (
+                  <span className="absolute top-1 right-1 h-2 w-2 bg-red-500 rounded-full border-2 border-background"></span>
+                )}
+                <span className="sr-only">Notifications</span>
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-[calc(100vw-3rem)] max-w-sm p-0" align="end">
+              {!jobAccepted ? (
+                <div className="p-4">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-semibold text-sm">New Job Notification</h3>
+                    <Badge variant="default" className="bg-[#7c4dff]">New</Badge>
+                  </div>
+                  
+                  <div className="mb-4">
+                    <div>
+                      <p className="text-xs font-medium text-muted-foreground mb-2">Summary</p>
+                      <p className="text-sm leading-relaxed">{jobSummary.summary}</p>
+                    </div>
+                  </div>
+                  
+                  <Button 
+                    className="w-full bg-[#7c4dff] hover:bg-[#6d3fef] text-white"
+                    onClick={handleAcceptJob}
+                  >
+                    Accept Job
+                  </Button>
+                </div>
+              ) : (
+                <div className="p-4 text-center">
+                  <p className="text-sm text-muted-foreground">No new notifications</p>
+                </div>
+              )}
+            </PopoverContent>
+          </Popover>
+          
+          <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" className="relative h-10 w-10 rounded-full p-0 overflow-hidden border-2 border-primary/20 hover:border-primary transition-colors">
               <Avatar className="h-full w-full">
@@ -129,7 +191,8 @@ const Dashboard = () => {
                <span>Log out</span>
              </DropdownMenuItem>
           </DropdownMenuContent>
-        </DropdownMenu>
+          </DropdownMenu>
+        </div>
       </header>
 
       <div className="p-4 sm:p-6">
