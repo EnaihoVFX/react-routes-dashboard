@@ -30,10 +30,10 @@ const stats = [
 
 const Dashboard = () => {
   return (
-    <div className="p-8 space-y-8">
+    <div className="p-4 sm:p-6 lg:p-8 space-y-6 sm:space-y-8">
       <div>
-        <h1 className="text-3xl font-bold tracking-tight">Dashboard</h1>
-        <p className="text-muted-foreground mt-2">
+        <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Dashboard</h1>
+        <p className="text-muted-foreground mt-2 text-sm sm:text-base">
           Welcome back! Here's what's happening with your business today.
         </p>
       </div>
@@ -57,19 +57,19 @@ const Dashboard = () => {
         ))}
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-7">
-        <Card className="col-span-4">
+      <div className="grid gap-4 lg:grid-cols-7">
+        <Card className="lg:col-span-4">
           <CardHeader>
             <CardTitle>Overview</CardTitle>
             <CardDescription>
               Your performance metrics for this month
             </CardDescription>
           </CardHeader>
-          <CardContent className="h-[300px] flex items-center justify-center text-muted-foreground">
+          <CardContent className="h-[250px] sm:h-[300px] flex items-center justify-center text-muted-foreground">
             Chart visualization would go here
           </CardContent>
         </Card>
-        <Card className="col-span-3">
+        <Card className="lg:col-span-3">
           <CardHeader>
             <CardTitle>Recent Activity</CardTitle>
             <CardDescription>

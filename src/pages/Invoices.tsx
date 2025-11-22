@@ -56,15 +56,15 @@ const getStatusColor = (status: string) => {
 
 const Invoices = () => {
   return (
-    <div className="p-8 space-y-8">
-      <div className="flex items-center justify-between">
+    <div className="p-4 sm:p-6 lg:p-8 space-y-6 sm:space-y-8">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">Invoices</h1>
-          <p className="text-muted-foreground mt-2">
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Invoices</h1>
+          <p className="text-muted-foreground mt-2 text-sm sm:text-base">
             Track and manage all your invoices in one place.
           </p>
         </div>
-        <Button className="gap-2">
+        <Button className="gap-2 w-full sm:w-auto">
           <Plus className="w-4 h-4" />
           Create Invoice
         </Button>
@@ -78,27 +78,27 @@ const Invoices = () => {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="space-y-4">
+          <div className="space-y-3 sm:space-y-4">
             {invoices.map((invoice) => (
               <div
                 key={invoice.id}
-                className="flex items-center justify-between p-4 border rounded-lg hover:bg-accent transition-colors"
+                className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-6 p-3 sm:p-4 border rounded-lg hover:bg-accent transition-colors"
               >
-                <div className="flex items-center gap-4">
-                  <div>
-                    <p className="font-semibold">{invoice.id}</p>
-                    <p className="text-sm text-muted-foreground">{invoice.client}</p>
+                <div className="flex items-start gap-3 sm:gap-4">
+                  <div className="flex-1">
+                    <p className="font-semibold text-sm sm:text-base">{invoice.id}</p>
+                    <p className="text-xs sm:text-sm text-muted-foreground">{invoice.client}</p>
                   </div>
                 </div>
-                <div className="flex items-center gap-6">
-                  <div className="text-right">
-                    <p className="font-semibold">{invoice.amount}</p>
-                    <p className="text-sm text-muted-foreground">{invoice.date}</p>
+                <div className="flex items-center justify-between sm:justify-end gap-3 sm:gap-6">
+                  <div className="text-left sm:text-right">
+                    <p className="font-semibold text-sm sm:text-base">{invoice.amount}</p>
+                    <p className="text-xs sm:text-sm text-muted-foreground">{invoice.date}</p>
                   </div>
                   <Badge variant="secondary" className={getStatusColor(invoice.status)}>
                     {invoice.status}
                   </Badge>
-                  <Button variant="ghost" size="icon">
+                  <Button variant="ghost" size="icon" className="shrink-0">
                     <Download className="w-4 h-4" />
                   </Button>
                 </div>
